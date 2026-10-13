@@ -255,3 +255,8 @@ One row per push of a feature branch.
 - **Integration.** The merge into local `xtcp2-integration` (`d46e512`) combined E01's `stats_vals` fault hook and `IONIC_RC_*` codes with D's value structs, kept both new CMake test blocks, and stubbed A's `ionic_eth_emu_count_rdma` in `test_ionic_dp_errors`. Pushed to the fork 2026-10-13.
 - **Matrix note.** As before, the six ctest modes ran with `ERNIC_WERROR` off and the warnings were checked per file.
 
+
+### 2026-10-13: go-link-monitor per-profile demo
+
+- **What.** xtcp2 `demo-linkmonitor-ionic-profiles` (randomizedcoder/xtcp2#210) boots the ionic guest once per profile on `xtcp2-integration` `d46e512` with a TAP peer, drives Ethernet and RDMA traffic, and scrapes go-link-monitor. Full output: [demo/go-link-monitor-profiles.md](demo/go-link-monitor-profiles.md), for the PR bodies.
+- **Observed.** Speed 100G except generic-400g (400G); port copper for compat/small-vm, fibre for the generics. Channels 4, 2, 8, 8 on 8 vCPUs; on 20 vCPUs generic-100g stops at 16 and generic-400g reaches 20. Every queue carried TX and RX packets. The faults run fired 47 `eth_tx` / 42 `eth_rx`, and the monitor saw 47 TX drops and 41 RX drops and over errors (the last RX fault came after the final publish). 35 `rdma_hw_counter` series in every profile; the RC ping-pong's 4,096,000 bytes each way matched exactly. The error counters stay 0 until E07 adds RDMA fault sites.

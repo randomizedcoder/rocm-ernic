@@ -181,3 +181,16 @@ One row per push of a feature branch.
 - **TSAN flake.** One TSAN ctest run failed `nvmeof-ci` and `s3-ci`; the rerun and the later full runs passed. F touches neither. Not yet compared against a develop TSAN ctest run.
 - **Guest check.** On a throwaway merge of F into `xtcp2-integration` `3ae9d46`, with `nix/ionic-guest-test.nix` extended to print `ip -d link`, `ethtool -i`, `ethtool` link and the RDMA `rate`, and to pass `ERNIC_NIC_PROFILE` through as `--nic-profile`. Values are in NR-F02 and NR-F03.
 - **Merge note.** `nix/analysis/fuzz.nix` carries the same `FUZZ_EMIT_SEEDS` seeds step as #222. The guest merge with #222 conflicted in `fuzz.nix`, its README, `tests/CMakeLists.txt` and `tests/nix/CMakeLists.txt`. All were list unions, and the upstream merge will need the same.
+
+### 2026-10-12: shutdown root cause and two small upstream fixes
+
+- **Root cause of the shutdown abort and hang (Phase 0, E01).** This corrects the E01 hypothesis. `tcp_backend_set_ionic_recv_cb()` and `tcp_backend_send_ionic_v()` cast `backend_private` to `TcpBackendPrivate` without checking that the backend is TCP. On loopback, #224's `ionic_device_fini()` → `ionic_datapath_destroy()` unhooks the mesh receive callback once a client has attached. That locks a mutex past the end of the smaller loopback state and writes two pointers after it. Whether glibc then aborts on the robust mutex or hangs depends on the heap, which is why any `--inject` (one extra allocation) turned the abort into a hang. On `develop` it's latent, because destroy only runs before any handle is set.
+  - Fix: [#226](https://github.com/ROCm/rocm-ernic/pull/226) `fix/tcp-ionic-hooks-backend-type` `93356ef`, from `develop` `e912e84`. It's independent of #224 but needed by it.
+  - Regression proof: with the two checks reverted, `ctest -R tcp-ionic-hooks-unit` under ASan → `heap-buffer-overflow … in tcp_backend_set_ionic_recv_cb rdma_backend_tcp.c:4724`.
+  - Evidence on `xtcp2-integration` `3ae9d46` + the fix: `nix run .#run-ionic-guest-test` 3 of 3 runs passed, each with "Shutdown complete" and no SIGKILL (before the fix, 1 of 3 aborted). On the E01 merge with `ERNIC_INJECT='stats_vals: after 1000 effect fail'`, the run without the fix logged "still running 10s after SIGTERM; sending SIGKILL"; the run with it logged "Shutdown complete".
+  - Gates: ctest 31/31 in gcc, clang, ASan and TSAN; clang-format 18, codespell and cmakelint clean.
+- **The `validate_backend_options()` ethdev leak** (the F gates finding).
+  - Fix: [#227](https://github.com/ROCm/rocm-ernic/pull/227) `fix/verbs-options-ethdev-leak` `9ac4e53`. Every error path in `parse_verbs_options()` now goes to one `fail:` that frees and NULLs both outputs.
+  - `analysis-deep` on develop + fix: no `Potential leak` in `rocm_ernic_server.c`. On F + fix, the `rocm_ernic_server.c:939 … 'ethdev' [unix.Malloc]` finding is gone. The only other delta is clang-tidy cognitive complexity of `parse_verbs_options`, 41 → 42.
+  - Gates: ctest 30/30 in all four modes.
+- **Still open.** The `analysis-sanitizers` SIGTERM-path leak (F gates) is #224's `ionic_device_fini()`; no separate PR.

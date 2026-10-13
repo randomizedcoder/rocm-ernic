@@ -15,9 +15,9 @@ States: `planned`, `in-progress`, `review` (PR open), `merged`, `dropped`. A dro
 
 | PR | Branch | State | PR link | Integration commit |
 |---|---|---|---|---|
-| A: LIF stats | `feat/ionic-lif-stats` | in-progress (A01–A07 committed on F, not pushed) | – | – |
+| A: LIF stats | `feat/ionic-lif-stats` | in-progress (A01–A07 committed on F, pushed to the fork 2026-10-13) | – | – |
 | B: port stats | `feat/ionic-port-stats` | planned | – | – |
-| C: queues/vectors | `feat/ionic-eth-queues` | in-progress (C01–C03 committed on A, not pushed) | – | – |
+| C: queues/vectors | `feat/ionic-eth-queues` | in-progress (C01–C03 committed on A, pushed to the fork 2026-10-13) | – | – |
 | D: RDMA counters | `feat/ionic-rdma-error-stats` | planned | – | – |
 | E: fault injection | `feat/ionic-fault-inject` | in-progress (E01) | – | – |
 | F: NIC profiles | `feat/ionic-nic-profiles` | in-progress (F01–F04, F06 committed, pushed to the fork) | – | – |

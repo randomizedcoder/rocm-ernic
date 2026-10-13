@@ -176,28 +176,30 @@ static const struct stats_case cases[] = {
 
     /* negative */
     {"negative", "QP values for an unmapped qp_id",
-     "rc 1 and nothing written, not a page of zeros", QP_VALS, BUF_GPA,
-     PAGE_LEN, (QP_ID + 100) | VER1, STATS_BODY_LEN, 0, 0, false, 1, 0,
+     "ENOENT (7) and nothing written, not a page of zeros", QP_VALS, BUF_GPA,
+     PAGE_LEN, (QP_ID + 100) | VER1, STATS_BODY_LEN, 0, 0, false,
+     IONIC_RC_ENOENT, 0, CONTENT_NONE},
+    {"negative", "headers with dma_addr 0", "BAD_ADDR (17) and nothing written",
+     HDRS, 0, PAGE_LEN, 0, STATS_BODY_LEN, 0, 0, false, IONIC_RC_BAD_ADDR, 0,
      CONTENT_NONE},
-    {"negative", "headers with dma_addr 0", "rc 1 and nothing written", HDRS, 0,
-     PAGE_LEN, 0, STATS_BODY_LEN, 0, 0, false, 1, 0, CONTENT_NONE},
     {"negative", "headers with a 16-byte body (no type_state)",
-     "rc 1 and nothing written", HDRS, BUF_GPA, PAGE_LEN, 0, STATS_BODY_LEN - 1,
-     0, 0, false, 1, 0, CONTENT_NONE},
+     "EINVAL (14) and nothing written", HDRS, BUF_GPA, PAGE_LEN, 0,
+     STATS_BODY_LEN - 1, 0, 0, false, IONIC_RC_EINVAL, 0, CONTENT_NONE},
     {"negative", "device values when the counter snapshot fails",
-     "rc 1 and nothing written", VALS, BUF_GPA, PAGE_LEN, 0, STATS_BODY_LEN,
-     -22, 0, false, 1, 0, CONTENT_NONE},
+     "EIO (3) and nothing written", VALS, BUF_GPA, PAGE_LEN, 0, STATS_BODY_LEN,
+     -22, 0, false, IONIC_RC_EIO, 0, CONTENT_NONE},
     {"negative", "QP values when the counter snapshot fails",
-     "rc 1 and nothing written", QP_VALS, BUF_GPA, PAGE_LEN, QP_ID | VER1,
-     STATS_BODY_LEN, 0, -22, false, 1, 0, CONTENT_NONE},
+     "EIO (3) and nothing written", QP_VALS, BUF_GPA, PAGE_LEN, QP_ID | VER1,
+     STATS_BODY_LEN, 0, -22, false, IONIC_RC_EIO, 0, CONTENT_NONE},
     {"negative", "headers into a buffer that runs off guest memory",
-     "rc 1 from the failed DMA and nothing written", HDRS, GUEST_MEM_SIZE - 64,
-     PAGE_LEN, 0, STATS_BODY_LEN, 0, 0, false, 1, 0, CONTENT_NONE},
+     "EIO (3) from the failed DMA and nothing written", HDRS,
+     GUEST_MEM_SIZE - 64, PAGE_LEN, 0, STATS_BODY_LEN, 0, 0, false,
+     IONIC_RC_EIO, 0, CONTENT_NONE},
 
     /* boundary */
     {"boundary", "headers with length 31, one byte short of an entry",
-     "rc 1 and nothing written", HDRS, BUF_GPA, 31, 0, STATS_BODY_LEN, 0, 0,
-     false, 1, 0, CONTENT_NONE},
+     "ENOSPC (15) and nothing written", HDRS, BUF_GPA, 31, 0, STATS_BODY_LEN, 0,
+     0, false, IONIC_RC_ENOSPC, 0, CONTENT_NONE},
     {"boundary", "headers with length 32, exactly one entry",
      "only the first header (32 bytes)", HDRS, BUF_GPA, 32, 0, STATS_BODY_LEN,
      0, 0, false, 0, 32, CONTENT_DEV_HDRS},
@@ -210,8 +212,8 @@ static const struct stats_case cases[] = {
      (DEV_STATS_COUNT + 1) * 32 - 1, 0, STATS_BODY_LEN, 0, 0, false, 0,
      DEV_STATS_COUNT * 32, CONTENT_DEV_HDRS},
     {"boundary", "values with length 7, one byte short of a value",
-     "rc 1 and nothing written", VALS, BUF_GPA, 7, 0, STATS_BODY_LEN, 0, 0,
-     false, 1, 0, CONTENT_NONE},
+     "ENOSPC (15) and nothing written", VALS, BUF_GPA, 7, 0, STATS_BODY_LEN, 0,
+     0, false, IONIC_RC_ENOSPC, 0, CONTENT_NONE},
     {"boundary", "values with length 8, exactly one value",
      "only the first value (8 bytes)", VALS, BUF_GPA, 8, 0, STATS_BODY_LEN, 0,
      0, false, 0, 8, CONTENT_DEV_VALS},
@@ -306,6 +308,192 @@ static void run_case(const struct stats_case *c)
     }
 }
 
+/* ---- Injected faults (ionic_fault.h) ---------------------------------- */
+
+#define FAULT_MAX_CMDS 4
+
+/*
+ * One fault and a run of identical commands against it.  Each command must
+ * complete with its own status; one that succeeds writes the full reply
+ * (@want_written bytes) and one that fails writes nothing.
+ */
+struct fault_case {
+    const char *category;
+    const char *description;
+    const char *expected;
+    const char *spec; /* --inject string */
+    uint8_t op;
+    uint32_t id_ver;
+    size_t ncmds;
+    uint8_t want_rc[FAULT_MAX_CMDS];
+    size_t want_written; /* bytes from a command that succeeds */
+};
+
+static const struct fault_case fault_cases[] = {
+    {"positive",
+     "device values with 'stats_vals: every 1 effect fail'",
+     "EIO (3) and no bytes written",
+     "stats_vals: every 1 effect fail",
+     VALS,
+     0,
+     1,
+     {IONIC_RC_EIO},
+     DEV_STATS_COUNT * 8},
+    {"positive",
+     "device values with 'fail status eversion'",
+     "status 1 (EVERSION) and no bytes written",
+     "stats_vals: every 1 effect fail status eversion",
+     VALS,
+     0,
+     1,
+     {IONIC_RC_EVERSION},
+     DEV_STATS_COUNT * 8},
+    {"positive",
+     "device values with 'fail status enoent'",
+     "status 7 (ENOENT) and no bytes written",
+     "stats_vals: every 1 effect fail status enoent",
+     VALS,
+     0,
+     1,
+     {IONIC_RC_ENOENT},
+     DEV_STATS_COUNT * 8},
+    {"boundary",
+     "'after 2' over 3 device-values commands",
+     "commands 1 and 3 succeed with the values; command 2 fails with EIO",
+     "stats_vals: after 2 effect fail",
+     VALS,
+     0,
+     3,
+     {IONIC_RC_SUCCESS, IONIC_RC_EIO, IONIC_RC_SUCCESS},
+     DEV_STATS_COUNT * 8},
+    {"boundary",
+     "'every 2' over 4 device-values commands",
+     "commands 2 and 4 fail; 1 and 3 succeed",
+     "stats_vals: every 2 effect fail",
+     VALS,
+     0,
+     4,
+     {IONIC_RC_SUCCESS, IONIC_RC_EIO, IONIC_RC_SUCCESS, IONIC_RC_EIO},
+     DEV_STATS_COUNT * 8},
+    {"corner",
+     "device headers with a stats_vals fault",
+     "headers still served: the site is STATS_VALS only",
+     "stats_vals: every 1 effect fail",
+     HDRS,
+     0,
+     2,
+     {IONIC_RC_SUCCESS, IONIC_RC_SUCCESS},
+     (DEV_STATS_COUNT + 1) * 32},
+    {"corner",
+     "QP values with a stats_vals fault",
+     "not affected: QP values are the qp_stats_vals site",
+     "stats_vals: every 1 effect fail",
+     QP_VALS,
+     QP_ID | VER1,
+     2,
+     {IONIC_RC_SUCCESS, IONIC_RC_SUCCESS},
+     QP_STATS_COUNT * 8},
+};
+
+static void run_fault_case(const struct fault_case *c)
+{
+    struct ionic_fault_set *set = ionic_fault_set_new();
+    char err[128] = "";
+    uint8_t body[64];
+    uint8_t got[FAULT_MAX_CMDS] = {0};
+    size_t got_written[FAULT_MAX_CMDS] = {0};
+    bool added =
+        set && ionic_fault_set_add(set, c->spec, err, sizeof(err)) == 0;
+    bool ok = added;
+
+    ctx_reset();
+    g_ctx.faults = set;
+    build_body(body, sizeof(body), BUF_GPA, PAGE_LEN, c->id_ver);
+    for (size_t k = 0; added && k < c->ncmds; k++) {
+        size_t want = c->want_rc[k] == IONIC_RC_SUCCESS ? c->want_written : 0;
+
+        memset(g_mem, POISON, sizeof(g_mem));
+        g_nwrites = 0;
+        got[k] = dispatch_wqe(&g_ctx, c->op, body, STATS_BODY_LEN);
+        got_written[k] = bytes_written(BUF_GPA);
+        if (got[k] != c->want_rc[k] || got_written[k] != want)
+            ok = false;
+    }
+    g_ctx.faults = NULL;
+    ionic_fault_set_free(set);
+
+    printf("%s %s: %s; expected: %s\n", ok ? "ok  " : "FAIL", c->category,
+           c->description, c->expected);
+    if (!ok) {
+        if (err[0])
+            printf("     spec rejected: %s\n", err);
+        for (size_t k = 0; k < c->ncmds; k++)
+            printf("     command %zu: got rc %u (want %u), %zu bytes written\n",
+                   k + 1, got[k], c->want_rc[k], got_written[k]);
+        failures++;
+    }
+}
+
+/* ---- Completion encoding ---------------------------------------------- */
+
+#define CQE_GPA 512u
+
+/*
+ * One admin completion posted with @status.  The driver reads
+ * be32_to_cpu(status_length) as the error and logs it as "opcode %u error
+ * %u", so the status code must be the whole be32 value, not one byte of it.
+ */
+struct cqe_case {
+    const char *category;
+    const char *description;
+    const char *expected;
+    uint8_t status;
+    uint32_t want_status_length; /* host order, after be32_to_cpu() */
+    bool want_error_bit;
+};
+
+static const struct cqe_case cqe_cases[] = {
+    {"positive", "a successful completion",
+     "status_length 0 and the error bit clear", IONIC_RC_SUCCESS, 0, false},
+    {"positive", "a completion with EIO",
+     "status_length 3, so dmesg reads 'error 3', and the error bit set",
+     IONIC_RC_EIO, 3, true},
+    {"positive", "a completion with ENOENT",
+     "status_length 7 and the error bit set", IONIC_RC_ENOENT, 7, true},
+    {"boundary", "the smallest error status (EVERSION)",
+     "status_length 1 and the error bit set", IONIC_RC_EVERSION, 1, true},
+    {"boundary", "the largest status a byte can carry",
+     "status_length 255, not 0xff000000", 255, 255, true},
+};
+
+static void run_cqe_case(const struct cqe_case *c)
+{
+    struct ionic_aq_ring r;
+    uint32_t sl, qtf;
+    bool ok;
+
+    ctx_reset();
+    memset(&r, 0, sizeof(r));
+    r.cq_dma = CQE_GPA;
+    r.cq_depth = 1;
+    post_admin_cqe(&g_ctx, &r, 0, VALS, c->status);
+    memcpy(&sl, g_mem + CQE_GPA + 24, 4);
+    memcpy(&qtf, g_mem + CQE_GPA + 28, 4);
+    sl = be32toh(sl);
+    qtf = be32toh(qtf);
+    ok = sl == c->want_status_length &&
+         ((qtf & CQE_ERROR_BIT) != 0) == c->want_error_bit;
+
+    printf("%s %s: %s; expected: %s\n", ok ? "ok  " : "FAIL", c->category,
+           c->description, c->expected);
+    if (!ok) {
+        printf("     got status_length %u (want %u), error bit %u\n", sl,
+               c->want_status_length,
+               (unsigned int)((qtf & CQE_ERROR_BIT) != 0));
+        failures++;
+    }
+}
+
 /*
  * Corner: the driver forces name[27] to NUL, so a name of 28 or more bytes
  * would lose its tail and could collide with another.  Every name must fit
@@ -333,6 +521,10 @@ int main(void)
 {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_case(&cases[i]);
+    for (size_t i = 0; i < sizeof(fault_cases) / sizeof(fault_cases[0]); i++)
+        run_fault_case(&fault_cases[i]);
+    for (size_t i = 0; i < sizeof(cqe_cases) / sizeof(cqe_cases[0]); i++)
+        run_cqe_case(&cqe_cases[i]);
     check_names("device stat", dev_stats, DEV_STATS_COUNT);
     check_names("QP stat", qp_stats, QP_STATS_COUNT);
 

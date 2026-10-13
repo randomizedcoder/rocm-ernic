@@ -26,7 +26,7 @@ Code references are to upstream `develop` (`e912e84`) unless marked **#222**, wh
 rocm-ernic lets a guest run the real `ionic` and `ionic_rdma` drivers against an emulated device. That makes it a useful place to test monitoring tools, for example go-link-monitor in xtcp2, on a real driver instead of fakes. But the counters the guest sees look nothing like a production NIC:
 
 - `ip -s link` and `/proc/net/dev` on the ionic netdev read **zero forever**. `ionic_get_stats64` builds them from a stats block the firmware DMAs into guest memory, and the emulator never writes that block.
-- The 126 MAC counters in `ethtool -S` (`frames_rx_*`, size buckets, per-priority frames, pause) are always zero for the same reason.
+- The 89 MAC counters in `ethtool -S` (`frames_rx_*`, size buckets, per-priority frames, pause) are always zero for the same reason.
 - 4 queue pairs are offered, and only RX queue 0 is ever served. A modern 100/200G NIC runs 48–128.
 - RDMA `hw_counters` has 5 entries (**#222**). Real NICs have 30–90, mostly error and congestion counters.
 - No error counter can ever become non-zero, so error paths in monitoring tools are never exercised on a real driver.
@@ -105,7 +105,7 @@ The emulator can only show what the ionic drivers read. These are the facts each
   - a union of `ionic_port_stats` and `ionic_mgmt_port_stats` at **576**
   - sprom pages, then reserved, then `extra_stats`
 - The driver allocates it as `ALIGN(sizeof, PAGE_SIZE)` (eth `ionic_main.c`, about 725). Today `handle_port_init` writes the first 320 bytes, which covers config and the start of status.
-- `ionic_port_stats` is 126 × `__le64`. `ethtool -S` lists all 126, in `ionic_port_stats_desc` order (eth `ionic_stats.c`): `frames_{rx,tx}_*`, `octets_*`, the 12 rx and 12 tx size buckets, `frames_{rx,tx}_pri_0..7`, `{tx,rx}_pripause_N_1us_count`, `rx_pause_1us_count` and `frames_tx_truncated`.
+- `ionic_port_stats` is 89 × `__le64` (712 bytes; an earlier draft said 126). `ethtool -S` lists all 89, in `ionic_port_stats_desc` order, which is also the struct order (eth `ionic_stats.c`): `frames_{rx,tx}_*`, `octets_*`, the 12 rx and 12 tx size buckets, `frames_{rx,tx}_pri_0..7`, `{tx,rx}_pripause_N_1us_count`, `rx_pause_1us_count` and `frames_tx_truncated`.
 - `extra_stats` is read only when `IONIC_DEV_CAP_EXTRA_STATS` is set. In that case `rx_bits_phy` must be real, or `IONIC_STAT_INVALID` (`~0`) to hide it. We leave the capability **unset** (§14).
 
 ### 4.3 Queues and interrupts
@@ -191,16 +191,16 @@ The inbox path's re-queue on `-ENOBUFS` is back-pressure, not a drop, and is **n
 | `frames_{rx,tx}_ok`, `octets_{rx,tx}_ok`, `frames_*_all`, `octets_*_all`/`_total` | real | every frame crossing the boundary; `octets` includes the 4-byte FCS the emulator does not carry, so it is frame length + 4, which is how real MACs count |
 | `frames_{rx,tx}_{unicast,multicast,broadcast}` | real | destination MAC |
 | the 12 rx and 12 tx size buckets (`less_than_64b` … `8192b_9215b`, `other`) | derived | frame length + 4 |
-| `frames_rx_too_long`, `frames_rx_oversized` | real | rx frame longer than MTU + header; the frame is still dropped as today |
-| `frames_rx_undersized` | real | rx frame shorter than 60 bytes before FCS |
-| `frames_{rx,tx}_vlan_good` / `frames_tx_vlan` | real | 802.1Q TPID present |
+| `frames_rx_too_long`, `frames_rx_oversized`, `frames_rx_bad_all` | real | rx frame longer than the port's maximum, `link.mtu_max` + 18 (what LIF_IDENTIFY reports as `max_frame_size`); the MAC drops it before the LIF sees it |
+| `frames_rx_undersized` | inject-only | every frame is counted padded to 60 bytes, as the sending MAC pads it (the TAP hands over unpadded 42-byte ARPs), so nothing is undersized; `frames_{rx,tx}_less_than_64b` stays zero too |
+| `frames_rx_vlan_good` / `frames_tx_vlan` | real | 802.1Q (0x8100) or 802.1ad (0x88a8) outer TPID present; PCP from the outer tag |
 | `frames_{rx,tx}_pri_0..7` | derived | VLAN PCP; untagged frames count as priority 0 |
 | `frames_rx_dropped` | real | same events as the A rx drops |
 | `frames_rx_bad_fcs`, `frames_rx_bad_all`, `frames_rx_stomped_crc` | inject-only | E `eth_rx` → `corrupt`; the frame is dropped |
 | `frames_rx_fragments`, `frames_rx_jabber`, `frames_rx_bad_length`, `frames_tx_bad`, `frames_tx_truncated` | inject-only | not reachable without a PHY; zero unless injected |
 | `frames_*_pause`, `frames_*_pripause`, `*_pripause_N_1us_count`, `rx_pause_1us_count` | inject-only | E `eth_rx` → `pause`; no flow control is emulated |
 
-**Guest result:** all 126 MAC lines in `ethtool -S` carry meaning, and the per-priority and size-bucket shape matches a real MAC.
+**Guest result:** all 89 MAC lines in `ethtool -S` carry meaning, and the per-priority and size-bucket shape matches a real MAC.
 
 **Files:** `src/ionic_eth_emu.c` and `src/ionic_emu_stats.{c,h}`.
 

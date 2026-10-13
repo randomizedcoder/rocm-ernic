@@ -91,7 +91,7 @@ Tests (extend `test_ionic_emu_stats.c`):
 - negative: an rx frame over the MTU counts `frames_rx_too_long` and is not delivered
 - boundary: 59/60-byte frames (undersized edge); PCP 7
 - corner: an untagged frame counts as priority 0; the buckets sum to `frames_*_all`
-- layout pin: `port_stats` at 576, with all 126 indices against `ionic_port_stats_desc` order
+- layout pin: `port_stats` at 576, with all 89 indices against `ionic_port_stats_desc` order
 - Regression proof: an off-by-one bucket edge fails the boundary rows.
 - Guest check: `ethtool -S` shows every `ionic_port_stats_desc` name, and `frames_rx_ok` grows with traffic.
 
@@ -220,7 +220,7 @@ Tests: new `tests/test_ionic_profile.c`.
 ## Done when
 
 - A–F are each merged upstream, or open with their gates green and recorded in STATUS.md.
-- The guest shows real `ip -s link`, 126 meaningful MAC counters, a configurable 1–64 queue shape, about 35 RDMA counters, and a reproducible fault for every inject-only counter.
+- The guest shows real `ip -s link`, 89 meaningful MAC counters, a configurable 1–64 queue shape, about 35 RDMA counters, and a reproducible fault for every inject-only counter.
 - All of it is selectable through built-in or user profiles, and `compat` is byte-identical to today's device.
 - The random fault models match kernel netem event for event at equal seeds (NR-E10), and every `*-hw-counters` overlay has a passing guest check.
 - xtcp2 pins an integration commit that contains them, and its ionic VM test asserts on them (tracked in xtcp2).

@@ -120,6 +120,13 @@ in
         StandardError = "journal+console";
       };
     };
-    environment.systemPackages = [ pkgs.rdma-core pkgs.ethtool pkgs.iproute2 pkgs.pciutils ];
+    # ernic-rdma-errors: the RDMA error counters, checked from the guest.
+    environment.systemPackages = [
+      pkgs.rdma-core
+      pkgs.ethtool
+      pkgs.iproute2
+      pkgs.pciutils
+      (pkgs.callPackage ./rdma-errors.nix { })
+    ];
   };
 }

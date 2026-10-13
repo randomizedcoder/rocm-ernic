@@ -18,8 +18,8 @@ States: `planned`, `in-progress`, `review` (PR open), `merged`, `dropped`. A dro
 | A: LIF stats | `feat/ionic-lif-stats` | in-progress (A01–A07 committed on F, pushed to the fork 2026-10-13) | – | – |
 | B: port stats | `feat/ionic-port-stats` | planned | – | – |
 | C: queues/vectors | `feat/ionic-eth-queues` | in-progress (C01–C03 committed on A, pushed to the fork 2026-10-13) | – | – |
-| D: RDMA counters | `feat/ionic-rdma-error-stats` | in-progress (D01–D03 committed on #222, not pushed) | – | local `xtcp2-integration` `d46e512` (not pushed) |
-| E: fault injection | `feat/ionic-fault-inject` (E01), `feat/ionic-eth-faults` (E07-lite, on C + E01) | in-progress (E01; E07-lite committed, not pushed) | – | local `xtcp2-integration` `9893fbf` (not pushed) |
+| D: RDMA counters | `feat/ionic-rdma-error-stats` | in-progress (D01–D03 committed on #222, pushed to the fork 2026-10-13) | – | fork `xtcp2-integration` `d46e512` |
+| E: fault injection | `feat/ionic-fault-inject` (E01), `feat/ionic-eth-faults` (E07-lite, on C + E01) | in-progress (E01 and E07-lite pushed to the fork) | – | fork `xtcp2-integration` `d46e512` |
 | F: NIC profiles | `feat/ionic-nic-profiles` | in-progress (F01–F04, F06 committed, pushed to the fork) | – | – |
 
 ## Task trace
@@ -252,6 +252,6 @@ One row per push of a feature branch.
 - **Names.** The user chose the Pensando `ionic_lif_stats` `rdma_*` names without the prefix, plus a go-link-monitor catch-all for uncataloged `hw_counters` files (xtcp2 `feat/linkmonitor-rdma-hw-counter-catchall`, P14-T06, V092), so the counters reach the monitor without guessing catalog names. DESIGN §14 q1 (real firmware names) stays open for the PR body.
 - **Deviations.** The `*_cqe_flush_err` counters exist but stay 0: the datapath has no QP→ERR flush. D04 waits for A. The `rdma.counters`, `rdma.names.*` and `rdma.stats` profile keys wait for F to be under D, so every build serves the full 35/38 tables. No `--stats-file` lines yet.
 - **Finding.** A local SEND whose source SGE names a bad lkey fails on the responder (recv CQE `LOCAL_PROT_ERR`) while the requester completes successfully. The plan's "SEND with a bad lkey" row therefore uses an RDMA WRITE with a bad lkey, and a corner row pins the SEND behavior as it is.
-- **Integration.** The merge into local `xtcp2-integration` (`d46e512`) combined E01's `stats_vals` fault hook and `IONIC_RC_*` codes with D's value structs, kept both new CMake test blocks, and stubbed A's `ionic_eth_emu_count_rdma` in `test_ionic_dp_errors`. Not pushed.
+- **Integration.** The merge into local `xtcp2-integration` (`d46e512`) combined E01's `stats_vals` fault hook and `IONIC_RC_*` codes with D's value structs, kept both new CMake test blocks, and stubbed A's `ionic_eth_emu_count_rdma` in `test_ionic_dp_errors`. Pushed to the fork 2026-10-13.
 - **Matrix note.** As before, the six ctest modes ran with `ERNIC_WERROR` off and the warnings were checked per file.
 

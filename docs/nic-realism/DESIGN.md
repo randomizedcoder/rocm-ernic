@@ -358,11 +358,12 @@ The guest-visible result of each effect follows from what the ionic RDMA driver 
 - One `STATS_VALS` fetches every counter.
 - The command waits with `IONIC_ADMIN_F_INTERRUPT`: an interruptible wait of `HZ`, i.e. 1 s (`drivers/infiniband/hw/ionic/ionic_admin.c`, `ionic_admin_wait`). On timeout the driver returns `-ETIMEDOUT`, logs `wait status -110` and calls `ionic_admin_cancel`.
 - Any CQE error becomes `-EINVAL`, with the log line `opcode %u error %u`.
+- The RDMA core reads the counters once while it registers the device (`ib_setup_device_attrs()` and the port hw-stats setup in `drivers/infiniband/core/sysfs.c` call `get_hw_stats()` from `ib_register_device()`), so the first `STATS_VALS` after LIF init is that registration read. If it fails, registration fails (`Failed to register ibdev`) and the guest has **no RDMA device**. Every `stats_vals` pattern counts the registration read as eligible event 1; a fault meant to leave the device in place starts at event 2 (`after 2 …`). Observed in E01 (STATUS Log 2026-10-12, E01 gates).
 - The admin watchdog kills an admin queue that makes no progress for `IONIC_ADMIN_TIMEOUT` (`HZ * 2`) and resets the RDMA LIF.
 
 | Effect | Emulator does | Guest sees | Real-world analogue |
 |---|---|---|---|
-| `fail [status S]` | completes with CQE error status S (`eio` default, `enoent`, `eversion`, …) | **every** `hw_counters` read fails with `EINVAL`; the kernel logs `opcode 5 error <S>` | the fleet's ConnectX-7 IB ports that refuse PortCounters |
+| `fail [status S]` | completes with CQE error status S (`eio` default, `enoent`, `eversion`, …) | **every** `hw_counters` read fails with `EINVAL`; the kernel logs `opcode 5 error <S>`. On the registration read (event 1) the device does not register at all | the fleet's ConnectX-7 IB ports that refuse PortCounters |
 | `stale` | returns the values from the previous successful reply | counters freeze (zero delta) while traffic flows | firmware that stopped refreshing its counters |
 | `zero` | returns all zeros once | counters drop to 0 and then jump back on the next good read | a firmware glitch; tests "counter went backwards" handling |
 | `reset` | zeroes the emulator's RDMA counters, then replies | counters restart from 0 and keep counting from there | a firmware or device reset that clears counters |
@@ -532,7 +533,7 @@ The `compat` column is the default. `compat` keeps today's behaviour exactly, so
 | `generic-400g` | the fleet's large-NIC shape | 400G, `fiber`, `queues.eth = 64`, `intr_vectors = auto`, `rdma.counters = all` |
 | `lossy-ethernet` (overlay) | Ethernet error paths | `eth_rx.fcs`: `random 0.1% 25%` → `corrupt`; `eth_rx.nobuf`: `gemodel 0.2% 20%` → `nobuf` (ring-full bursts); `eth_rx.pause`: `every 200` → `pause` |
 | `rdma-errors` (overlay) | RDMA error and congestion paths | `rdma_rx.rnr`: `every 100` → `rnr`; `rdma_rx.seq`: `random 0.1%` → `seq_err`; `rdma_tx`: `gemodel 2% 10%` → `cnp` (congestion episodes) |
-| `unreadable-hw-counters` (overlay) | the fleet's ConnectX-7 case, through ionic | `stats_vals`: `every 1` → `fail` |
+| `unreadable-hw-counters` (overlay) | the fleet's ConnectX-7 case, through ionic | `stats_vals`: `after 2 count 18446744073709551615` → `fail` (every read after the registration read) |
 | `flaky-hw-counters` (overlay) | intermittent read failures in bursts, with recovery | `stats_vals`: `gemodel 2% 50%` → `fail` (about 2 % of commands start an outage averaging 2 commands) |
 | `stuck-hw-counters` (overlay) | counters that freeze for minutes | `stats_vals`: `every 1` → `stale`, `window on 5min off 25min` |
 | `resetting-hw-counters` (overlay) | counters cleared by a device reset | `stats_vals`: `every 600` → `reset` (about every 10 min at a 1 s scrape) |
@@ -624,8 +625,8 @@ rocm-ernic-server --nic-profile generic-400g --nic-profile ./my-400g-lossy.ini -
 - `ethtool -S` has every `ionic_port_stats_desc` name, and size buckets sum to `frames_rx_all`.
 - `ethtool -l` matches `--eth-queues` capped by vCPUs.
 - `hw_counters` holds the D names. A bad-rkey write moves `req_rx_remote_access_err` by exactly 1.
-- With `--inject 'stats_vals: after 1 effect fail'`, one `hw_counters` read returns `EINVAL` (log `opcode 5 error 3`) and the next one succeeds.
-- With `stats_vals: after 1 effect timeout 1500ms`, the read returns `ETIMEDOUT` after about 1 s (log `wait status -110`), the next read succeeds, and the RDMA LIF is **not** reset.
+- With `--inject 'stats_vals: after 2 effect fail'`, one `hw_counters` read returns `EINVAL` (log `opcode 5 error 3`) and the next one succeeds. (`after 1` fails the registration read instead, and the guest has no RDMA device.)
+- With `stats_vals: after 2 effect timeout 1500ms`, the read returns `ETIMEDOUT` after about 1 s (log `wait status -110`), the next read succeeds, and the RDMA LIF is **not** reset.
 - With `flaky-hw-counters`, `fault_stats_vals_fired` equals the number of failed reads the guest saw.
 - `hang` with `faults.allow_destructive = true`: confirm the 2 s watchdog LIF reset and record it (NR-E09).
 

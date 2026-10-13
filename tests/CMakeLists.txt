@@ -528,6 +528,24 @@ target_include_directories(test_ionic_fault PRIVATE
 target_compile_options(test_ionic_fault PRIVATE ${ERNIC_UNIT_TEST_SAN})
 target_link_options(test_ionic_fault PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
 
+# ionic RDMA error-counter test. It #includes the datapath translation unit
+# and fakes guest memory, the mesh and the clock, so each error path runs
+# end to end with no vfio-user link and the RNR and pending-timeout rows sit
+# exactly on their boundaries.
+add_executable(test_ionic_dp_errors test_ionic_dp_errors.c)
+target_include_directories(test_ionic_dp_errors PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_include_directories(test_ionic_dp_errors SYSTEM PRIVATE
+    ${VFIO_USER_INCLUDE_DIRS}
+    ${GLIB2_INCLUDE_DIRS}
+    ${ERNIC_IBVERBS_INCLUDE_DIRS}
+)
+target_compile_definitions(test_ionic_dp_errors PRIVATE _GNU_SOURCE)
+target_compile_options(test_ionic_dp_errors PRIVATE ${ERNIC_UNIT_TEST_SAN})
+target_link_options(test_ionic_dp_errors PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+target_link_libraries(test_ionic_dp_errors PRIVATE pthread)
+
 # ionic CQ arm-semantics test. It #includes the datapath translation unit to
 # reach the private CQ state and counts the event callback in-process, so no
 # vfio-user link or guest memory is needed.
@@ -768,6 +786,7 @@ set(ERNIC_TEST_TARGETS
     test_server_lifecycle
     test_ionic_fault
     test_ionic_cq_arm
+    test_ionic_dp_errors
     test_tcp_mesh_topology
     test_tcp_gid_resolve
     test_tcp_mr_bounds
@@ -1020,6 +1039,15 @@ add_test(
     COMMAND $<TARGET_FILE:test_ionic_cq_arm>
 )
 set_tests_properties(ionic-cq-arm-unit PROPERTIES TIMEOUT 30)
+
+# ionic RDMA error-counter unit test: asserts each RDMA error the data path
+# hands the guest moves exactly the hw_counters it names, on the device and
+# on the QP involved, and nothing else.
+add_test(
+    NAME ionic-dp-errors-unit
+    COMMAND $<TARGET_FILE:test_ionic_dp_errors>
+)
+set_tests_properties(ionic-dp-errors-unit PROPERTIES TIMEOUT 30)
 
 # TCP mesh-topology broadcast unit test: asserts the unused node slots in the
 # fixed-size payload are zeroed rather than carrying stack contents.

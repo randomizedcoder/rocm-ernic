@@ -388,6 +388,7 @@ target_include_directories(test_ionic_emu_stats PRIVATE
 target_compile_definitions(test_ionic_emu_stats PRIVATE _GNU_SOURCE)
 target_compile_options(test_ionic_emu_stats PRIVATE ${ERNIC_UNIT_TEST_SAN})
 target_link_options(test_ionic_emu_stats PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+target_link_libraries(test_ionic_emu_stats PRIVATE pthread)
 
 # ionic NIC identity test. It #includes the eth emulator translation unit,
 # checks the compat profile against golden bytes captured before profiles

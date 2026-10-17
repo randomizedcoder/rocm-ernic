@@ -833,9 +833,13 @@ ssize_t ionic_eth_emu_bar2_access(struct ionic_eth_emu *emu, char *buf,
 
 /* Write one statistics block, logging a failure once until a write works. */
 static void publish_block(struct ionic_eth_emu *emu, const char *what,
-                          uint64_t pa, uint8_t *block, size_t len, bool *failed)
+                          uint64_t base, uint64_t offset, uint8_t *block,
+                          size_t len, bool *failed)
 {
-    if (eth_dma_rw(emu->vfu_ctx, pa, block, len, true) < 0) {
+    bool address_valid = base <= UINT64_MAX - offset - (len - 1);
+    uint64_t pa = address_valid ? base + offset : base;
+
+    if (!address_valid || eth_dma_rw(emu->vfu_ctx, pa, block, len, true) < 0) {
         if (!*failed)
             vfu_log(emu->vfu_ctx, LOG_WARNING,
                     "ionic_eth_emu: %s stats write to %#lx failed; retrying "
@@ -863,16 +867,15 @@ void ionic_eth_emu_publish_stats(struct ionic_eth_emu *emu, uint64_t now_ms)
         uint8_t block[IONIC_LIF_STATS_BYTES];
 
         ionic_emu_stats_fill(&emu->stats, block);
-        publish_block(emu, "LIF", emu->lif_info_pa + IONIC_LIF_INFO_STATS_OFF,
+        publish_block(emu, "LIF", emu->lif_info_pa, IONIC_LIF_INFO_STATS_OFF,
                       block, sizeof(block), &emu->stats_write_failed);
     }
     if (emu->port_info_pa) {
         uint8_t block[IONIC_PORT_STATS_BYTES];
 
         ionic_emu_port_fill(&emu->stats, block);
-        publish_block(emu, "port",
-                      emu->port_info_pa + IONIC_PORT_INFO_STATS_OFF, block,
-                      sizeof(block), &emu->port_stats_write_failed);
+        publish_block(emu, "port", emu->port_info_pa, IONIC_PORT_INFO_STATS_OFF,
+                      block, sizeof(block), &emu->port_stats_write_failed);
     }
 }
 

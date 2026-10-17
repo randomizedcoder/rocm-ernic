@@ -531,13 +531,17 @@ static void independent_block_failures(void)
 {
     static const struct {
         const char *description;
+        const char *expected;
         uint64_t failing;
         bool lif_ok;
         bool port_ok;
     } cases[] = {
-        {"positive: both mappings succeed", UINT64_MAX, true, true},
-        {"negative: LIF mapping fails", LIF_BLOCK, false, true},
-        {"negative: port mapping fails", PORT_BLOCK, true, false},
+        {"positive: both mappings succeed", "both blocks written; no warnings",
+         UINT64_MAX, true, true},
+        {"negative: LIF mapping fails", "only LIF stays poisoned; port updates",
+         LIF_BLOCK, false, true},
+        {"negative: port mapping fails",
+         "only port stays poisoned; LIF updates", PORT_BLOCK, true, false},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         struct ionic_eth_emu *emu = new_emu(10);
@@ -571,9 +575,9 @@ static void independent_block_failures(void)
         g_fail_write_pa = cases[i].failing;
         ionic_eth_emu_publish_stats(emu, 130);
         ok = ok && g_nwarnings == (expected_writes == 2 ? 0u : 2u);
-        printf("%s %s; expected: only failed block stays poisoned, warn once, "
+        printf("%s %s; expected: %s; warn once, "
                "recover totals 7/11, warn on new failure\n",
-               ok ? "ok" : "FAIL", cases[i].description);
+               ok ? "ok" : "FAIL", cases[i].description, cases[i].expected);
         if (!ok)
             failures++;
         ionic_eth_emu_destroy(emu);
@@ -622,38 +626,100 @@ static void reset_and_reregister(void)
     }
 }
 
+static uint64_t port_qword_at(uint64_t base, unsigned int idx)
+{
+    uint64_t value;
+
+    memcpy(&value, g_mem + base + IONIC_PORT_INFO_STATS_OFF + (size_t)idx * 8,
+           8);
+    return le64toh(value);
+}
+
 static void port_address_boundaries(void)
 {
     static const struct {
+        const char *category;
         const char *description;
+        const char *expected;
         uint64_t base;
+        unsigned int attempts;
         unsigned int writes;
     } cases[] = {
-        {"exact guest-memory end",
-         GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES,
+        {"positive", "ordinary registered address",
+         "one mapping and exact block write", PORT_PA, 1, 1},
+        {"positive", "unaligned address", "unaligned DMA is supported",
+         PORT_PA + 1, 1, 1},
+        {"negative", "zero means unregistered", "no mapping or guest write", 0,
+         0, 0},
+        {"boundary", "smallest nonzero address",
+         "one mapping and exact block write", 1, 1, 1},
+        {"boundary", "block ends one byte before guest-memory end",
+         "one trailing byte preserved",
+         GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES -
+             1,
+         1, 1},
+        {"boundary", "block ends exactly at guest-memory end",
+         "last byte written; prefix preserved",
+         GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES, 1,
          1},
-        {"one byte beyond guest memory",
+        {"negative", "one byte beyond guest memory",
+         "mapping rejected; all guest bytes preserved",
          GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES +
              1,
-         0},
-        {"port offset wraps", UINT64_MAX - IONIC_PORT_INFO_STATS_OFF + 1, 0},
-        {"port block end wraps",
-         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES + 2,
-         0},
+         1, 0},
+        {"boundary", "last representable complete block",
+         "valid arithmetic; unmapped range rejected",
+         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF - (IONIC_PORT_STATS_BYTES - 1),
+         1, 0},
+        {"boundary", "block end overflows by one byte",
+         "reject before DMA; all guest bytes preserved",
+         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF - (IONIC_PORT_STATS_BYTES - 1) +
+             1,
+         0, 0},
+        {"boundary", "offset reaches UINT64_MAX",
+         "block cannot fit; reject before DMA",
+         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF, 0, 0},
+        {"corner", "offset wraps to guest address zero",
+         "reject before DMA; address zero untouched",
+         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF + 1, 0, 0},
+        {"corner", "maximum base address",
+         "reject before DMA; all guest bytes preserved", UINT64_MAX, 0, 0},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         struct ionic_eth_emu *emu = new_emu(10);
         bool ok;
 
+        /* Isolate stats DMA from PORT_INIT's separately tested status DMA. */
         emu->port_info_pa = cases[i].base;
         emu->stats_publish_now = true;
+        emu->stats.port[IONIC_PORT_FRAMES_TX_OK] = 7;
         ionic_eth_emu_publish_stats(emu, 100);
-        ok = g_nwrites == cases[i].writes;
-        if (!cases[i].writes)
+        ok = g_write_attempts == cases[i].attempts &&
+             g_nwrites == cases[i].writes;
+        if (!cases[i].writes) {
             ok = ok && poisoned(0, sizeof(g_mem)) == sizeof(g_mem);
-        printf("%s boundary: %s; expected: %u writes, invalid range leaves "
-               "guest memory untouched\n",
-               ok ? "ok" : "FAIL", cases[i].description, cases[i].writes);
+        } else {
+            uint64_t start = cases[i].base + IONIC_PORT_INFO_STATS_OFF;
+            size_t end = (size_t)start + IONIC_PORT_STATS_BYTES;
+
+            ok = ok &&
+                 port_qword_at(cases[i].base, IONIC_PORT_FRAMES_TX_OK) == 7 &&
+                 poisoned(0, (size_t)start) == start &&
+                 poisoned(end, sizeof(g_mem) - end) == sizeof(g_mem) - end;
+        }
+        /* A second tick retries failures without corrupting counters. */
+        ionic_eth_emu_publish_stats(emu, 110);
+        ok = ok && g_write_attempts == 2 * cases[i].attempts &&
+             g_nwrites == 2 * cases[i].writes;
+        port_init(emu, PORT_PA);
+        g_write_attempts = 0;
+        ionic_eth_emu_publish_stats(emu, 120);
+        ok = ok && g_write_attempts == 1 && g_nwrites == 1 &&
+             port_qword_at(PORT_PA, IONIC_PORT_FRAMES_TX_OK) == 7;
+        printf("%s %s: %s; expected: %s; retry and re-registration retain 7 "
+               "packets\n",
+               ok ? "ok" : "FAIL", cases[i].category, cases[i].description,
+               cases[i].expected);
         if (!ok)
             failures++;
         ionic_eth_emu_destroy(emu);

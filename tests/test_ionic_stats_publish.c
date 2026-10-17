@@ -91,6 +91,7 @@ static struct ionic_eth_emu *new_emu(uint32_t interval_ms)
     memset(g_mem, POISON, sizeof(g_mem));
     g_nwrites = 0;
     g_fail_writes = 0;
+    g_fail_write_pa = UINT64_MAX;
     g_nwarnings = 0;
     g_net_send_rc = 0;
     g_net_rx_frame = NULL;
@@ -523,6 +524,139 @@ static void before_port_init(char *got, size_t len)
     snprintf(got, len, "writes %u, port block poisoned %zu", g_nwrites,
              poisoned(PORT_BLOCK, IONIC_PORT_STATS_BYTES));
     ionic_eth_emu_destroy(emu);
+}
+
+static void independent_block_failures(void)
+{
+    static const struct {
+        const char *description;
+        uint64_t failing;
+        bool lif_ok;
+        bool port_ok;
+    } cases[] = {
+        {"positive: both mappings succeed", UINT64_MAX, true, true},
+        {"negative: LIF mapping fails", LIF_BLOCK, false, true},
+        {"negative: port mapping fails", PORT_BLOCK, true, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct ionic_eth_emu *emu = new_emu(10);
+        unsigned int expected_writes =
+            (unsigned int)cases[i].lif_ok + (unsigned int)cases[i].port_ok;
+        bool ok;
+
+        lif_init(emu, LIF_PA);
+        port_init(emu, PORT_PA);
+        emu->stats.lif[IONIC_LIF_TX_UCAST_PACKETS] = 7;
+        emu->stats.port[IONIC_PORT_FRAMES_TX_OK] = 11;
+        memset(g_mem, POISON, sizeof(g_mem));
+        g_nwrites = 0;
+        g_nwarnings = 0;
+        g_fail_write_pa = cases[i].failing;
+        ionic_eth_emu_publish_stats(emu, 100);
+        ionic_eth_emu_publish_stats(emu, 110);
+        ok = g_nwrites == 2 * expected_writes &&
+             g_nwarnings == (expected_writes == 2 ? 0u : 1u) &&
+             poisoned(LIF_BLOCK, IONIC_LIF_STATS_BYTES) ==
+                 (cases[i].lif_ok ? 0 : IONIC_LIF_STATS_BYTES) &&
+             poisoned(PORT_BLOCK, IONIC_PORT_STATS_BYTES) ==
+                 (cases[i].port_ok ? 0 : IONIC_PORT_STATS_BYTES);
+        g_fail_write_pa = UINT64_MAX;
+        g_nwrites = 0;
+        ionic_eth_emu_publish_stats(emu, 120);
+        ok = ok && g_nwrites == 2 && !emu->stats_write_failed &&
+             !emu->port_stats_write_failed &&
+             guest_qword(LIF_PA, IONIC_LIF_TX_UCAST_PACKETS) == 7 &&
+             guest_port_qword(IONIC_PORT_FRAMES_TX_OK) == 11;
+        g_fail_write_pa = cases[i].failing;
+        ionic_eth_emu_publish_stats(emu, 130);
+        ok = ok && g_nwarnings == (expected_writes == 2 ? 0u : 2u);
+        printf("%s %s; expected: only failed block stays poisoned, warn once, "
+               "recover totals 7/11, warn on new failure\n",
+               ok ? "ok" : "FAIL", cases[i].description);
+        if (!ok)
+            failures++;
+        ionic_eth_emu_destroy(emu);
+    }
+}
+
+static void reset_and_reregister(void)
+{
+    static const struct {
+        const char *description;
+        uint8_t opcode;
+        uint64_t lif_packets;
+        uint64_t port_packets;
+    } cases[] = {
+        {"corner: LIF reset and re-register", IONIC_CMD_LIF_RESET, 7, 11},
+        {"corner: port reset and re-register", IONIC_CMD_PORT_RESET, 7, 11},
+        {"negative: device reset and re-register", IONIC_CMD_RESET, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct ionic_eth_emu *emu = new_emu(10);
+        bool ok;
+
+        lif_init(emu, LIF_PA);
+        port_init(emu, PORT_PA);
+        emu->stats.lif[IONIC_LIF_TX_UCAST_PACKETS] = 7;
+        emu->stats.port[IONIC_PORT_FRAMES_TX_OK] = 11;
+        devcmd(emu, cases[i].opcode, 0);
+        lif_init(emu, LIF_PA2);
+        port_init(emu, PORT_PA);
+        memset(g_mem, POISON, sizeof(g_mem));
+        g_nwrites = 0;
+        ionic_eth_emu_publish_stats(emu, 100);
+        ok = g_nwrites == 2 &&
+             poisoned(LIF_BLOCK, IONIC_LIF_STATS_BYTES) ==
+                 IONIC_LIF_STATS_BYTES &&
+             guest_qword(LIF_PA2, IONIC_LIF_TX_UCAST_PACKETS) ==
+                 cases[i].lif_packets &&
+             guest_port_qword(IONIC_PORT_FRAMES_TX_OK) == cases[i].port_packets;
+        printf("%s %s; expected: old LIF address untouched, re-registered "
+               "counters %" PRIu64 "/%" PRIu64 "\n",
+               ok ? "ok" : "FAIL", cases[i].description, cases[i].lif_packets,
+               cases[i].port_packets);
+        if (!ok)
+            failures++;
+        ionic_eth_emu_destroy(emu);
+    }
+}
+
+static void port_address_boundaries(void)
+{
+    static const struct {
+        const char *description;
+        uint64_t base;
+        unsigned int writes;
+    } cases[] = {
+        {"exact guest-memory end",
+         GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES,
+         1},
+        {"one byte beyond guest memory",
+         GUEST_MEM_SIZE - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES +
+             1,
+         0},
+        {"port offset wraps", UINT64_MAX - IONIC_PORT_INFO_STATS_OFF + 1, 0},
+        {"port block end wraps",
+         UINT64_MAX - IONIC_PORT_INFO_STATS_OFF - IONIC_PORT_STATS_BYTES + 2,
+         0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct ionic_eth_emu *emu = new_emu(10);
+        bool ok;
+
+        emu->port_info_pa = cases[i].base;
+        emu->stats_publish_now = true;
+        ionic_eth_emu_publish_stats(emu, 100);
+        ok = g_nwrites == cases[i].writes;
+        if (!cases[i].writes)
+            ok = ok && poisoned(0, sizeof(g_mem)) == sizeof(g_mem);
+        printf("%s boundary: %s; expected: %u writes, invalid range leaves "
+               "guest memory untouched\n",
+               ok ? "ok" : "FAIL", cases[i].description, cases[i].writes);
+        if (!ok)
+            failures++;
+        ionic_eth_emu_destroy(emu);
+    }
 }
 
 static const struct publish_case port_publish_cases[] = {
@@ -1149,6 +1283,9 @@ static const struct publish_case stats_file_cases[] = {
 int main(void)
 {
     address_boundaries();
+    independent_block_failures();
+    reset_and_reregister();
+    port_address_boundaries();
     run_cases(publish_cases, sizeof(publish_cases) / sizeof(publish_cases[0]));
     run_cases(datapath_cases,
               sizeof(datapath_cases) / sizeof(datapath_cases[0]));

@@ -29,7 +29,7 @@
  * Large enough for a published port_info plus the LIF info block, with the
  * two placed far enough apart that a write to one cannot reach the other.
  */
-#define GUEST_MEM_SIZE 8192
+#define GUEST_MEM_SIZE 16384
 static uint8_t g_mem[GUEST_MEM_SIZE];
 
 /* DMA writes seen since the test last cleared it. */
@@ -40,6 +40,9 @@ static unsigned int g_write_attempts;
 
 /* Refuse this many of the next DMA write mappings, as an unmapped GPA would. */
 static unsigned int g_fail_writes;
+
+/* Selectively reject one block without suppressing the other publication. */
+static uint64_t g_fail_write_pa = UINT64_MAX;
 
 /* LOG_WARNING (or worse) messages logged since the test last cleared it. */
 static unsigned int g_nwarnings;
@@ -72,6 +75,8 @@ int vfu_addr_to_sgl(vfu_ctx_t *vfu_ctx, vfu_dma_addr_t dma_addr, size_t len,
         g_write_attempts++;
     /* Written so a dma_addr near UINT64_MAX can't wrap past the check. */
     if (max_nr_sgs < 1 || addr > GUEST_MEM_SIZE || len > GUEST_MEM_SIZE - addr)
+        return -1;
+    if ((prot & PROT_WRITE) && addr == g_fail_write_pa)
         return -1;
     if ((prot & PROT_WRITE) && g_fail_writes) {
         g_fail_writes--;

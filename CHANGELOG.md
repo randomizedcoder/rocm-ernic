@@ -119,6 +119,12 @@
   `--stats-interval-ms`, 10 to 60000, default 1000) and cleared on reset.
   `--stats-file` gains a "LIF Statistics" section. Documented in
   `docs/ionic.rst`.
+* The ionic NIC publishes its port (MAC) statistics, the 89 counters
+  `ethtool -S` shows as `frames_*` and `octets_*`, which the driver used to
+  list as 0: frames and octets by result, by unicast, multicast and
+  broadcast, and by size bucket, counted as on the wire. They are published
+  with the LIF statistics and cleared on PORT_RESET. Documented in
+  `docs/ionic.rst`.
 
 ### Changed
 

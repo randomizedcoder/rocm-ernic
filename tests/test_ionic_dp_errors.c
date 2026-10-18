@@ -346,7 +346,7 @@ void pvrdma_rdma_bytes_count(pvrdma_handle_t handle, uint32_t qp_id,
 static int failures;
 
 static const char *const counter_name[IONIC_DP_RDMA_COUNT] = {
-#define COUNTER_NAME(id, name) [IONIC_DP_##id] = name,
+#define COUNTER_NAME(id, name) [IONIC_DP_##id] = (name),
     IONIC_DP_RDMA_COUNTERS(COUNTER_NAME)
 #undef COUNTER_NAME
 };

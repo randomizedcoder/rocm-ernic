@@ -468,7 +468,7 @@ static void test_fill(void)
 /* ---- Port (MAC) counters ------------------------------------------------ */
 
 #define MAX_FRAME_1500 1518u /* MTU 1500 + VLAN_ETH_HLEN */
-#define UNTAGGED       -1
+#define UNTAGGED       (-1)
 
 /* A @len-byte frame to @dst, tagged with @tpid and PCP @pcp unless @pcp < 0. */
 static const uint8_t *tagged_to(const uint8_t *dst, size_t len, uint16_t tpid,

@@ -28,6 +28,7 @@
 #include "ionic_eth_emu.c"
 
 #include "ionic_eth_emu_fakes.h"
+#include "parse_int.h"
 
 /* ---- Guest memory layout ----------------------------------------------- */
 
@@ -788,14 +789,32 @@ static char *stats_text(void *opaque, size_t *len)
     return buf;
 }
 
+/* The number from @p to the end of its line, or UINT64_MAX if it isn't one. */
+static uint64_t line_u64(const char *p)
+{
+    char num[24];
+    size_t n = strcspn(p, "\n");
+    uint64_t v;
+
+    if (n >= sizeof(num))
+        return UINT64_MAX;
+    memcpy(num, p, n);
+    num[n] = '\0';
+    return ernic_parse_u64(num, &v) ? v : UINT64_MAX;
+}
+
 /* The value on the "  @name ... : N" line, or -1 as UINT64_MAX if absent. */
 static uint64_t stats_value(const char *text, const char *name)
 {
     size_t n = strlen(name);
 
     for (const char *l = text; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : l)
-        if (!strncmp(l, "  ", 2) && !strncmp(l + 2, name, n) && l[2 + n] == ' ')
-            return strtoull(strstr(l, " : ") + 3, NULL, 10);
+        if (!strncmp(l, "  ", 2) && !strncmp(l + 2, name, n) &&
+            l[2 + n] == ' ') {
+            const char *sep = strstr(l, " : ");
+
+            return sep ? line_u64(sep + 3) : UINT64_MAX;
+        }
     return UINT64_MAX;
 }
 
@@ -832,7 +851,7 @@ static void file_shape(char *got, size_t len)
         /* Two spaces, a 35-wide name, then " : ". */
         if (strncmp(l + 2 + LIF_STAT_NAME_WIDTH, " : ", 3) != 0)
             misaligned++;
-        else if (strtoull(l + 2 + LIF_STAT_NAME_WIDTH + 3, NULL, 10) != 0)
+        else if (line_u64(l + 2 + LIF_STAT_NAME_WIDTH + 3) != 0)
             nonzero++;
     }
     snprintf(got, len,

@@ -12,11 +12,10 @@
  * See the LICENSE_GPL.md file in the top-level directory.
  */
 
+#include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "parse_int.h"
 
@@ -32,6 +31,13 @@ struct port_case {
     const char *input;
     bool expect_ok;
     uint16_t expect_val;
+};
+
+struct u64_case {
+    const char *name;
+    const char *input; /* NULL exercises the NULL path */
+    bool expect_ok;
+    uint64_t expect_val; /* checked only when expect_ok */
 };
 
 static int run_int(const struct int_case *tc)
@@ -68,6 +74,27 @@ static int run_port(const struct port_case *tc)
     return 0;
 }
 
+static int run_u64(const struct u64_case *tc)
+{
+    uint64_t v = UINT64_C(0xDEAD);
+    bool ok = ernic_parse_u64(tc->input, &v);
+    if (ok != tc->expect_ok) {
+        printf("FAIL u64 %-16s: ok=%d expected %d\n", tc->name, ok,
+               tc->expect_ok);
+        return 1;
+    }
+    if (ok && v != tc->expect_val) {
+        printf("FAIL u64 %-16s: val=%" PRIu64 " expected %" PRIu64 "\n",
+               tc->name, v, tc->expect_val);
+        return 1;
+    }
+    if (!ok && v != UINT64_C(0xDEAD)) {
+        printf("FAIL u64 %-16s: wrote %" PRIu64 " on failure\n", tc->name, v);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     static const struct int_case int_cases[] = {
@@ -91,6 +118,24 @@ int main(void)
         {"empty", "", false, 0},
     };
 
+    static const struct u64_case u64_cases[] = {
+        {"null", NULL, false, 0},
+        {"empty", "", false, 0},
+        {"valid", "1234", true, 1234},
+        {"zero", "0", true, 0},
+        {"leading-zeros", "007", true, 7},
+        {"above-int-max", "4294967296", true, UINT64_C(4294967296)},
+        {"u64-max", "18446744073709551615", true, UINT64_MAX},
+        {"u64-max-plus-1", "18446744073709551616", false, 0},
+        {"u64-max-times-10", "184467440737095516150", false, 0},
+        {"negative", "-1", false, 0},
+        {"plus-sign", "+1", false, 0},
+        {"leading-space", " 1", false, 0},
+        {"trailing-newline", "1\n", false, 0},
+        {"trailing-garbage", "12x", false, 0},
+        {"hex", "0x10", false, 0},
+    };
+
     int failures = 0;
     size_t ni = sizeof(int_cases) / sizeof(int_cases[0]);
     size_t np = sizeof(port_cases) / sizeof(port_cases[0]);
@@ -100,11 +145,15 @@ int main(void)
     for (size_t i = 0; i < np; i++) {
         failures += run_port(&port_cases[i]);
     }
+    size_t nu = sizeof(u64_cases) / sizeof(u64_cases[0]);
+    for (size_t i = 0; i < nu; i++) {
+        failures += run_u64(&u64_cases[i]);
+    }
 
     if (failures) {
         printf("parse_int: %d case(s) FAILED\n", failures);
         return 1;
     }
-    printf("parse_int: all %zu cases passed\n", ni + np);
+    printf("parse_int: all %zu cases passed\n", ni + np + nu);
     return 0;
 }

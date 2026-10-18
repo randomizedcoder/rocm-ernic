@@ -36,6 +36,7 @@
 
 #include <infiniband/verbs.h>
 #include "ernic_counter_snapshot.h"
+#include "parse_int.h"
 
 #define PORT_NUM        1
 #define BUF_SIZE        4096u
@@ -145,7 +146,7 @@ static int read_counters(const char *device, struct counters *c)
         if (snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name) >=
             (int)sizeof(path))
             continue;
-        f = fopen(path, "r");
+        f = fopen(path, "re");
         if (!f || !fgets(text, sizeof(text), f)) {
             fprintf(stderr, "%s: unreadable\n", path);
             if (f)
@@ -651,21 +652,18 @@ int main(int argc, char **argv)
     int opt;
 
     while ((opt = getopt(argc, argv, "d:g:h")) != -1) {
-        char *end;
-        long v;
+        int v;
 
         switch (opt) {
         case 'd':
             want_device = optarg;
             break;
         case 'g':
-            errno = 0;
-            v = strtol(optarg, &end, 10);
-            if (errno != 0 || *end != '\0' || v < 0 || v > 255) {
+            if (!ernic_parse_int(optarg, &v) || v < 0 || v > 255) {
                 usage(argv[0]);
                 return 2;
             }
-            env.gid_index = (int)v;
+            env.gid_index = v;
             break;
         default:
             usage(argv[0]);

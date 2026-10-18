@@ -44,6 +44,13 @@ enum ionic_v1_admin_op {
     IONIC_V1_ADMIN_DESTROY_AH = 16,
     IONIC_V1_ADMIN_QP_STATS_HDRS = 17,
     IONIC_V1_ADMIN_QP_STATS_VALS = 18,
+    /* 19-25 reserved upstream for series in flight (RCQ and friends); the
+     * SRQ opcodes were assigned explicitly at 26 and must keep those
+     * numbers. See enum ionic_v1_admin_op in the kernel's ionic_fw.h. */
+    IONIC_V1_ADMIN_CREATE_SRQ = 26,
+    IONIC_V1_ADMIN_MODIFY_SRQ = 27,
+    IONIC_V1_ADMIN_QUERY_SRQ = 28,
+    IONIC_V1_ADMIN_DESTROY_SRQ = 29,
 };
 
 /*
@@ -84,6 +91,10 @@ enum ionic_v1_admin_op {
 #define MAX_AQ     4
 #define MAX_CQ_MAP 256
 #define MAX_QP_MAP 256
+/* Tied to the advertised ceiling, not merely equal to it today: max_srq comes
+ * from IONIC_EMU_SRQ_COUNT, and a map smaller than that silently loses the
+ * mappings for every SRQ past the end. */
+#define MAX_SRQ_MAP IONIC_EMU_SRQ_COUNT
 /*
  * One entry per region the rdma_rm table can hold.  At 256 against a
  * 1024-entry table, every MR past the 256th was created successfully and then
@@ -124,6 +135,11 @@ struct ionic_adminq_ctx {
     /* pvrdma handle for calling ionic_rm_* compat wrappers. */
     pvrdma_handle_t pvrdma_handle;
 
+    /* Bytes a handler DMA'd into the command's response buffer, for the
+     * completion's status_length. Reset before every dispatch; only the
+     * handlers that write a response set it. */
+    uint32_t resp_len;
+
     /* Raises an EQ event once a CQE has been written. */
     ionic_adminq_cq_event_fn_t cq_event_fn;
     void *cq_event_opaque;
@@ -149,6 +165,31 @@ struct ionic_adminq_ctx {
         uint32_t mr_id;
         uint32_t handle;
     } mr_map[MAX_MR_MAP];
+
+    /*
+     * SRQs differ from every map above: WE pick the id, not the driver.
+     * The LIF identity advertises IONIC_LIF_RDMA_ALLOC_QID_SRQ, which tells
+     * the driver that firmware allocates SRQ qids, so CREATE_SRQ carries the
+     * driver's qid only as a hint and takes the real one out of the DMA'd
+     * response (ionic_controlpath.c: srq->rq.qid = le32_to_cpu(resp_buf->id)).
+     * adminq_alloc_srq() is that allocator, and the slot index below is the
+     * id: see the comment there for why it is not a counter.
+     */
+    struct ionic_srq_map_entry {
+        bool valid;
+        uint32_t srq_id;
+        uint32_t handle;
+        /*
+         * Ours, not the resource manager's. rdma_rm_modify_srq() rejects a
+         * limit of 0 outright (rdma_rm.c), but 0 is the legal value meaning
+         * "no low-watermark", and the guest driver accepts it -- so routing
+         * every limit through the resource manager turned a valid
+         * ibv_modify_srq(srq_limit=0) into an error. The resource manager
+         * never does anything with the value either way: nothing reads it
+         * back except QUERY_SRQ, which now reads this.
+         */
+        uint32_t srq_limit;
+    } srq_map[MAX_SRQ_MAP];
 
     /* ionic allocates protection domains entirely in the driver, so no PD
      * ever reaches us.  rdma_rm still needs one, so share a single backend PD
@@ -237,9 +278,9 @@ IONIC_DP_RDMA_COUNTERS(RDMA_STAT_NAME_FITS)
 _Static_assert(DEV_STATS_COUNT <= STATS_MAX_COUNT, "dev_stats too long");
 _Static_assert(QP_STATS_COUNT <= STATS_MAX_COUNT, "qp_stats too long");
 
-#ifdef ERNIC_ADMINQ_TEST
-uint8_t ionic_adminq_test_dispatch(struct ionic_adminq_ctx *ctx, uint8_t op,
-                                   const uint8_t *body, uint16_t len);
-#endif
+/* Run one admin command body, as the poll loop does for a WQE, and return
+ * its status. For the tests and fuzzers, which have no guest ring. */
+uint8_t ionic_adminq_dispatch(struct ionic_adminq_ctx *ctx, uint8_t op,
+                              const uint8_t *body, uint16_t len);
 
 #endif

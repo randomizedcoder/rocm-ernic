@@ -60,7 +60,7 @@
 #include "fuzz_harness.h"
 
 #define MAX_BODY   64
-#define IN_HDR     2
+#define IN_HDR     ((size_t)2)
 #define F_OP_MASK  0x03u
 #define F_DEV_FAIL 0x04u
 #define F_QP_FAIL  0x08u
@@ -201,7 +201,7 @@ static const char *run_input(const uint8_t *data, size_t size, uint8_t *rc_out)
         id_ver = le32toh(id_ver);
     }
 
-    rc = ionic_adminq_test_dispatch(&g_ctx, op, body, (uint16_t)body_len);
+    rc = ionic_adminq_dispatch(&g_ctx, op, body, (uint16_t)body_len);
     *rc_out = rc;
 
     if (rc != 0 && rc != 1)
@@ -343,8 +343,13 @@ static void emit_seed(size_t i, const uint8_t *buf, size_t len)
     bool ok;
 
     snprintf(path, sizeof(path), "seed-%02zu", i);
-    /* Never overwrite an existing file or follow a planted symlink. */
+    /* Never overwrite an existing file or follow a planted symlink.  With
+     * _FORTIFY_SOURCE, glibc 2.40 and later give Clang an
+     * open(path, flags, mode) overload, and android-cloexec-open looks for
+     * O_CLOEXEC in its mode */
+    /* NOLINTBEGIN(android-cloexec-open) */
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    /* NOLINTEND(android-cloexec-open) */
     if (fd < 0) {
         fprintf(stderr, "fuzz_ionic_stats: cannot create %s\n", path);
         exit(EXIT_FAILURE);

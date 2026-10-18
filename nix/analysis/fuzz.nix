@@ -51,7 +51,7 @@ let
       extra = [ ]; }
     { name = "ionic_stats";
       extra = [ "src/ionic_adminq.c" ];
-      cflags = "-Itests -I${libvfioUser}/include -DERNIC_ADMINQ_TEST";
+      cflags = "-Itests -I${libvfioUser}/include";
       seeds = true; }
   ];
 

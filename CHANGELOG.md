@@ -109,6 +109,12 @@
   `stats_type`, and the STATS_HDRS, STATS_VALS, QP_STATS_HDRS and
   QP_STATS_VALS admin commands are implemented; before, the driver created no
   counters at all.
+* `--inject 'SITE: PATTERN effect EFFECT [status S]'` (repeatable) injects
+  faults into the emulated ionic NIC, with tc netem's grammar and the
+  deterministic patterns `every N`, `after N [count M]`, `burst N every M`
+  and `sequence "..."`. The first site is `stats_vals`, which makes the
+  guest's `hw_counters` reads fail on demand (`effect fail`). A malformed
+  fault stops the server at startup with an error naming the bad token.
 
 ### Changed
 
@@ -529,6 +535,10 @@
   could only partly parse. The Nix Check workflow builds the new
   `analysis-runners` check, which tests these targets' scripts against a
   fake server, client and scan.
+* An ionic admin command that fails now carries its status code as the whole
+  `status_length` of the completion, as the driver reads it, so the guest's
+  log shows `opcode 5 error 3` instead of `error 50331648`. Each statistics
+  error has its own status code. The errno the guest sees doesn't change.
 
 ### Limitations
 

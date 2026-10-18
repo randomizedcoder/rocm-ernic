@@ -31,6 +31,8 @@
 
 #include "ionic_adminq.h"
 #include "ionic_datapath.h"
+#include "ionic_fault.h"
+#include "ionic_status.h"
 #include "rocm_ernic_compat.h"
 
 #include "ionic_adminq_internal.h"
@@ -40,6 +42,13 @@ void ionic_adminq_set_datapath(struct ionic_adminq_ctx *ctx,
 {
     if (ctx)
         ctx->dp = dp;
+}
+
+void ionic_adminq_set_faults(struct ionic_adminq_ctx *ctx,
+                             struct ionic_fault_set *faults)
+{
+    if (ctx)
+        ctx->faults = faults;
 }
 
 static int adminq_get_pd(struct ionic_adminq_ctx *ctx, uint32_t *pd_handle)
@@ -452,7 +461,7 @@ static int adminq_parse_roce_hdr(struct ionic_adminq_ctx *ctx, uint64_t gpa,
  * -------------------------------------------------------------------------
  */
 
-static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
+void ionic_adminq_post_cqe(struct ionic_adminq_ctx *ctx,
                            struct ionic_aq_ring *r, uint16_t cmd_idx,
                            uint8_t cmd_op, uint8_t status, uint32_t resp_len)
 {
@@ -462,7 +471,8 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
      *   [3:19]  u8   rsvd[17]
      *   [20:21] le16 old_sq_cindex
      *   [22:23] le16 old_rq_cq_cindex
-     *   [24:27] be32 status_length  (status in bits[31:24] when error set)
+     *   [24:27] be32 status_length  (the status code when error is set; the
+     *           driver logs be32_to_cpu() of it as "opcode %u error %u")
      *   [28:31] be32 qid_type_flags (color[0], error[1], type[7:5], qid[31:8])
      */
     uint8_t cqe[CQE_SIZE];
@@ -472,8 +482,8 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
     memcpy(cqe + 0, &ci, 2);
     cqe[2] = cmd_op;
 
-    /* status_length is one field doing two jobs: the status in bits[31:24]
-     * when the error bit is set, and otherwise the number of response bytes
+    /* status_length is one field doing two jobs: the status code itself when
+     * the error bit is set, and otherwise the number of response bytes
      * written. Returning 0 on success is not "no length given" to a driver
      * that reads it -- ionic_create_srq_cmd() compares it against
      * IONIC_ADMIN_CREATE_SRQ_OUT_V1_LEN and reports EOPNOTSUPP when it is
@@ -481,7 +491,7 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
      * ibv_create_srq() returning "Operation not supported" on a device that
      * had just handled the command. The ops that DMA no response still send
      * 0, which is their correct length. */
-    uint32_t sl = htobe32(status ? ((uint32_t)status << 24) : resp_len);
+    uint32_t sl = htobe32(status ? (uint32_t)status : resp_len);
     memcpy(cqe + 24, &sl, 4);
 
     /* qid_type_flags: bit 0 = color, bit 1 = error, bits[7:5] = type
@@ -1138,7 +1148,7 @@ static uint8_t stats_write_hdrs(struct ionic_adminq_ctx *ctx, uint64_t dma,
     size_t fit = length / STAT_HDR_SIZE;
 
     if (fit == 0)
-        return 1;
+        return IONIC_RC_ENOSPC;
     if (entries > fit)
         entries = fit;
 
@@ -1154,8 +1164,9 @@ static uint8_t stats_write_hdrs(struct ionic_adminq_ctx *ctx, uint64_t dma,
         memcpy(buf + i * STAT_HDR_SIZE + 4, stats[i].name, name_len);
     }
 
-    return dma_write(ctx->vfu_ctx, dma, buf, entries * STAT_HDR_SIZE) < 0 ? 1
-                                                                          : 0;
+    return dma_write(ctx->vfu_ctx, dma, buf, entries * STAT_HDR_SIZE) < 0
+               ? IONIC_RC_EIO
+               : IONIC_RC_SUCCESS;
 }
 
 /* Write the values the matching headers describe, clamped to @length. */
@@ -1168,7 +1179,7 @@ static uint8_t stats_write_vals(struct ionic_adminq_ctx *ctx, uint64_t dma,
     size_t n = length / STAT_VAL_SIZE;
 
     if (n == 0)
-        return 1;
+        return IONIC_RC_ENOSPC;
     if (n > count)
         n = count;
 
@@ -1181,7 +1192,9 @@ static uint8_t stats_write_vals(struct ionic_adminq_ctx *ctx, uint64_t dma,
         memcpy(buf + i * STAT_VAL_SIZE, &v, STAT_VAL_SIZE);
     }
 
-    return dma_write(ctx->vfu_ctx, dma, buf, n * STAT_VAL_SIZE) < 0 ? 1 : 0;
+    return dma_write(ctx->vfu_ctx, dma, buf, n * STAT_VAL_SIZE) < 0
+               ? IONIC_RC_EIO
+               : IONIC_RC_SUCCESS;
 }
 
 static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
@@ -1194,7 +1207,7 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
     if (len < STATS_BODY_LEN) {
         vfu_log(ctx->vfu_ctx, LOG_ERR, "ionic_adminq stats op=%u: short body",
                 op);
-        return 1;
+        return IONIC_RC_EINVAL;
     }
     memcpy(&dma, body, 8);
     dma = le64toh(dma);
@@ -1205,7 +1218,7 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
     if (!dma) {
         vfu_log(ctx->vfu_ctx, LOG_ERR, "ionic_adminq stats op=%u: no buffer",
                 op);
-        return 1;
+        return IONIC_RC_BAD_ADDR;
     }
 
     switch (op) {
@@ -1216,10 +1229,19 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
         return stats_write_hdrs(ctx, dma, length, qp_stats, QP_STATS_COUNT);
 
     case IONIC_V1_ADMIN_STATS_VALS: {
+        struct ionic_fault *f =
+            ionic_fault_set_get(ctx->faults, IONIC_FAULT_SITE_STATS_VALS);
         struct pvrdma_dev_counters c;
 
+        if (ionic_fault_event(f)) {
+            vfu_log(ctx->vfu_ctx, LOG_INFO,
+                    "ionic_adminq STATS_VALS: injected fail status %u "
+                    "(event %" PRIu64 ")",
+                    (unsigned int)f->status, f->eligible);
+            return f->status;
+        }
         if (pvrdma_get_dev_counters(ctx->pvrdma_handle, &c) != 0)
-            return 1;
+            return IONIC_RC_EIO;
         return stats_write_vals(ctx, dma, length, dev_stats, DEV_STATS_COUNT,
                                 &c);
     }
@@ -1234,15 +1256,15 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
         if (!adminq_lookup_qp(ctx, qp_id, &qpn)) {
             vfu_log(ctx->vfu_ctx, LOG_ERR,
                     "ionic_adminq QP_STATS_VALS: unknown qp_id=%u", qp_id);
-            return 1;
+            return IONIC_RC_ENOENT;
         }
         if (pvrdma_get_qp_counters(ctx->pvrdma_handle, qp_id, &c) != 0)
-            return 1;
+            return IONIC_RC_EIO;
         return stats_write_vals(ctx, dma, length, qp_stats, QP_STATS_COUNT, &c);
     }
 
     default:
-        return 1;
+        return IONIC_RC_EOPCODE;
     }
 }
 
@@ -1819,7 +1841,7 @@ void ionic_adminq_poll(struct ionic_adminq_ctx *ctx, vfu_ctx_t *vfu_ctx)
             uint16_t cmd_idx = (uint16_t)slot;
             uint8_t status =
                 dispatch_wqe(ctx, op, wqe_buf + ADMIN_WQE_HDR_LEN, len);
-            post_admin_cqe(ctx, r, cmd_idx, op, status, ctx->resp_len);
+            ionic_adminq_post_cqe(ctx, r, cmd_idx, op, status, ctx->resp_len);
             pvrdma_adminq_count(ctx->pvrdma_handle);
 
             /* Never write back to guest WQE memory — the driver owns the ring.

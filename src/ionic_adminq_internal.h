@@ -70,7 +70,7 @@ enum ionic_v1_admin_op {
  *     le16 old_sq_cindex
  *     le16 old_rq_cq_cindex
  *   Followed by (at byte 28):
- *     be32 status_length   (status in high byte when error bit set)
+ *     be32 status_length   (the status code when the error bit is set)
  *     be32 qid_type_flags
  *       bit 0:  color
  *       bit 1:  error
@@ -199,6 +199,9 @@ struct ionic_adminq_ctx {
 
     /* Data path that owns the SQ/RQ/CQ rings these commands describe. */
     struct ionic_datapath *dp;
+
+    /* Injected faults; owned by the server. */
+    struct ionic_fault_set *faults;
 };
 
 #define STATS_BODY_LEN  17
@@ -242,6 +245,11 @@ static const struct adminq_stat qp_stats[] = {
 
 _Static_assert(DEV_STATS_COUNT <= STATS_MAX_COUNT, "dev_stats too long");
 _Static_assert(QP_STATS_COUNT <= STATS_MAX_COUNT, "qp_stats too long");
+
+/* Internal production completion writer, shared with module tests. */
+void ionic_adminq_post_cqe(struct ionic_adminq_ctx *ctx,
+                           struct ionic_aq_ring *r, uint16_t cmd_idx,
+                           uint8_t cmd_op, uint8_t status, uint32_t resp_len);
 
 /* Run one admin command body, as the poll loop does for a WQE, and return
  * its status. For the tests and fuzzers, which have no guest ring. */

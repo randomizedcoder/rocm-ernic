@@ -633,7 +633,7 @@ static void check_format_boundaries(void)
         const char *description;
         const char *expected;
         int capacity; /* -2: needed-1, -1: needed, 0: needed+1; else literal */
-    } cases[] = {
+    } format_cases[] = {
         {"boundary", "one-byte buffer", "NUL only; canary preserved", 1},
         {"negative", "two bytes short including NUL",
          "truncated prefix and NUL; canary preserved", -2},
@@ -659,11 +659,13 @@ static void check_format_boundaries(void)
         ionic_fault_clear(&fault);
         return;
     }
-    for (size_t row = 0; row < sizeof(cases) / sizeof(cases[0]); row++) {
+    for (size_t row = 0; row < sizeof(format_cases) / sizeof(format_cases[0]);
+         row++) {
         char out[257];
-        size_t capacity = cases[row].capacity <= 0
-                              ? (size_t)(needed + cases[row].capacity + 1)
-                              : (size_t)cases[row].capacity;
+        size_t capacity =
+            format_cases[row].capacity <= 0
+                ? (size_t)(needed + format_cases[row].capacity + 1)
+                : (size_t)format_cases[row].capacity;
         size_t written =
             capacity - 1 < (size_t)needed ? capacity - 1 : (size_t)needed;
         bool ok;
@@ -674,8 +676,8 @@ static void check_format_boundaries(void)
         for (size_t j = written + 1; j < sizeof(out); j++)
             ok = ok && out[j] == 'Z';
         printf("%s %s: %s; expected: %s\n", ok ? "ok" : "FAIL",
-               cases[row].category, cases[row].description,
-               cases[row].expected);
+               format_cases[row].category, format_cases[row].description,
+               format_cases[row].expected);
         if (!ok)
             failures++;
     }

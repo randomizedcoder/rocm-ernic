@@ -293,6 +293,87 @@ void pvrdma_qp_stats_forget(pvrdma_handle_t handle, uint32_t qp_id)
     (void)qp_id;
 }
 
+/* SRQ and address-handle entry points: reached only by opcodes the
+ * statistics tests never send, so they refuse or do nothing. */
+int ionic_rm_alloc_srq(pvrdma_handle_t handle, uint32_t pd_handle,
+                       uint32_t max_wr, uint32_t max_sge, uint32_t srq_limit,
+                       uint32_t *srq_handle)
+{
+    (void)handle;
+    (void)pd_handle;
+    (void)max_wr;
+    (void)max_sge;
+    (void)srq_limit;
+    (void)srq_handle;
+    return -1;
+}
+void ionic_rm_dealloc_srq(pvrdma_handle_t handle, uint32_t srq_handle)
+{
+    (void)handle;
+    (void)srq_handle;
+}
+int ionic_rm_modify_srq(pvrdma_handle_t handle, uint32_t srq_handle,
+                        uint32_t srq_limit)
+{
+    (void)handle;
+    (void)srq_handle;
+    (void)srq_limit;
+    return -1;
+}
+int ionic_rm_query_srq(pvrdma_handle_t handle, uint32_t srq_handle,
+                       uint32_t *max_wr, uint32_t *max_sge, uint32_t *srq_limit)
+{
+    (void)handle;
+    (void)srq_handle;
+    (void)max_wr;
+    (void)max_sge;
+    (void)srq_limit;
+    return -1;
+}
+int ionic_datapath_register_srq(struct ionic_datapath *dp, uint32_t srq_id,
+                                const struct ionic_dp_ring_desc *rq)
+{
+    (void)dp;
+    (void)srq_id;
+    (void)rq;
+    return -1;
+}
+void ionic_datapath_unregister_srq(struct ionic_datapath *dp, uint32_t srq_id)
+{
+    (void)dp;
+    (void)srq_id;
+}
+void ionic_datapath_bind_qp_srq(struct ionic_datapath *dp, uint32_t qp_id,
+                                uint32_t srq_id)
+{
+    (void)dp;
+    (void)qp_id;
+    (void)srq_id;
+}
+void ionic_datapath_set_qkey(struct ionic_datapath *dp, uint32_t qp_id,
+                             uint32_t qkey)
+{
+    (void)dp;
+    (void)qp_id;
+    (void)qkey;
+}
+void ionic_datapath_register_ah(struct ionic_datapath *dp, uint32_t ah_id,
+                                const uint8_t dgid[16], const uint8_t sgid[16],
+                                const uint8_t dmac[6], uint32_t dest_node_id)
+{
+    (void)dp;
+    (void)ah_id;
+    (void)dgid;
+    (void)sgid;
+    (void)dmac;
+    (void)dest_node_id;
+}
+void ionic_datapath_unregister_ah(struct ionic_datapath *dp, uint32_t ah_id)
+{
+    (void)dp;
+    (void)ah_id;
+}
+
 /*
  * The counter snapshots the handler reads.  Every value is distinct and
  * free of POISON bytes, so a value landing in the wrong slot, or a slot

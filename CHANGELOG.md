@@ -102,6 +102,13 @@
   The tests that only run a script or CMake are left out.
   `tcp-thread-stop-unit` skips its out-of-descriptors row under valgrind,
   which it detects with `<valgrind/valgrind.h>` when that's installed.
+* Guests running the in-tree `ionic_rdma` driver get a `hw_counters`
+  directory under `/sys/class/infiniband/<dev>/ports/1/`, with device and
+  per-QP counters (commands, bytes sent and received, RDMA read and write
+  bytes, doorbells, WQEs and CQEs). The LIF identity now advertises
+  `stats_type`, and the STATS_HDRS, STATS_VALS, QP_STATS_HDRS and
+  QP_STATS_VALS admin commands are implemented; before, the driver created no
+  counters at all.
 
 ### Changed
 

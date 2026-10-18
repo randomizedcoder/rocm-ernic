@@ -113,3 +113,11 @@ add_test(
         $<TARGET_FILE:fuzz_replay_eth_classify>
 )
 set_tests_properties(fuzz-seed-files-eth_classify PROPERTIES TIMEOUT 30)
+
+# Check private seed files and rejection of existing filesystem entries.
+add_test(
+    NAME fuzz-seed-files-profile_parse
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_fuzz_seed_files.sh
+        $<TARGET_FILE:fuzz_replay_profile_parse>
+)
+set_tests_properties(fuzz-seed-files-profile_parse PROPERTIES TIMEOUT 30)

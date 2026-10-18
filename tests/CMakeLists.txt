@@ -402,6 +402,12 @@ target_link_options(test_ionic_stats PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
 # and fakes guest memory, the mesh and the clock, so each error path runs
 # end to end with no vfio-user link and the RNR and pending-timeout rows sit
 # exactly on their boundaries.
+add_executable(test_ionic_counter_snapshot test_ionic_counter_snapshot.c)
+target_compile_options(test_ionic_counter_snapshot PRIVATE ${ERNIC_UNIT_TEST_SAN})
+target_link_options(test_ionic_counter_snapshot PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+add_test(NAME ionic-counter-snapshot-unit COMMAND test_ionic_counter_snapshot)
+set_tests_properties(ionic-counter-snapshot-unit PROPERTIES TIMEOUT 30)
+
 add_executable(test_ionic_dp_errors test_ionic_dp_errors.c)
 target_include_directories(test_ionic_dp_errors PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -620,6 +626,7 @@ set(ERNIC_TEST_TARGETS
     test_ionic_query_qp
     test_ionic_stats
     test_ionic_cq_arm
+    test_ionic_counter_snapshot
     test_ionic_dp_errors
     test_tcp_mesh_topology
     test_tcp_gid_resolve

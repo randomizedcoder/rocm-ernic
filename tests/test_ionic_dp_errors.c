@@ -1182,8 +1182,78 @@ static void run_sq_case(const struct sq_case *c)
     }
 }
 
+static void check_late_responses(void)
+{
+    static const struct {
+        const char *category;
+        const char *description;
+        const char *expected;
+        bool expire;
+        uint32_t status;
+    } rows[] = {
+        {"positive", "duplicate successful ACK",
+         "one CQE, no second counter change", false, IONIC_STS_OK},
+        {"negative", "duplicate error ACK",
+         "one error CQE/count, no second counter change", false,
+         IONIC_STS_REMOTE_ACC_ERR},
+        {"boundary", "success arrives after timeout",
+         "timeout CQE/count retained exactly once", true, IONIC_STS_OK},
+        {"corner", "error arrives twice after timeout",
+         "timeout CQE/count retained exactly once", true,
+         IONIC_STS_REMOTE_ACC_ERR},
+    };
+    static const uint32_t views[] = {QP_A, QP_B, QP_C, IONIC_DP_DEVICE};
+
+    for (size_t row = 0; row < sizeof(rows) / sizeof(rows[0]); row++) {
+        struct ionic_datapath *dp = setup();
+        struct ionic_wire_hdr request, reply = {0};
+        uint64_t before[4][IONIC_DP_RDMA_COUNT], after[IONIC_DP_RDMA_COUNT];
+        bool ok = dp != NULL;
+
+        if (dp) {
+            remote(dp, QP_B);
+            post_send(dp, QP_A, &SEND64);
+            ok = g_nwire == 1;
+            if (ok) {
+                memcpy(&request, g_wire[0], sizeof(request));
+                reply.magic = request.magic;
+                reply.op = IONIC_WIRE_ACK;
+                reply.src_qp_id = request.dst_qp_id;
+                reply.dst_qp_id = request.src_qp_id;
+                reply.req_id = request.req_id;
+                reply.status = htole32(rows[row].status);
+                g_nwire = 0;
+                if (rows[row].expire)
+                    poll_at(dp, T0 + PENDING_MS + 1);
+                else {
+                    dp_mesh_recv(dp, PEER_NODE, &reply, sizeof(reply));
+                    poll_at(dp, T0 + 1);
+                }
+                ok = dp->cq[CQ_ID].prod == 1;
+                for (size_t v = 0; v < 4; v++)
+                    ionic_datapath_rdma_counters(dp, views[v], before[v]);
+                for (unsigned int repeat = 0; repeat < 2; repeat++) {
+                    dp_mesh_recv(dp, PEER_NODE, &reply, sizeof(reply));
+                    poll_at(dp, g_now_ms + 1);
+                }
+                ok = ok && dp->cq[CQ_ID].prod == 1;
+                for (size_t v = 0; v < 4; v++) {
+                    ionic_datapath_rdma_counters(dp, views[v], after);
+                    ok = ok && memcmp(before[v], after, sizeof(after)) == 0;
+                }
+            }
+            ionic_datapath_destroy(dp);
+        }
+        printf("%s %s: %s; expected: %s\n", ok ? "ok" : "FAIL",
+               rows[row].category, rows[row].description, rows[row].expected);
+        if (!ok)
+            failures++;
+    }
+}
+
 int main(void)
 {
+    check_late_responses();
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_case(&cases[i]);
     for (size_t i = 0; i < sizeof(getter_cases) / sizeof(getter_cases[0]); i++)

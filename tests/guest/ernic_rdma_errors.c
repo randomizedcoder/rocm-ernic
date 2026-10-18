@@ -35,24 +35,17 @@
 #include <unistd.h>
 
 #include <infiniband/verbs.h>
+#include "ernic_counter_snapshot.h"
 
 #define PORT_NUM        1
 #define BUF_SIZE        4096u
-#define MAX_COUNTERS    64u
 #define MAX_WANT        4u
-#define NAME_LEN        64u
 #define POLL_TIMEOUT_MS 10000u
 /* ionic_rdma's hw_counters are cached for `lifespan` ms (10); wait past it. */
 #define SETTLE_MS 100u
 /* Long enough that the emulator's RNR pass finds no receive, well inside its
  * RNR_RETRY_MS (5000) so the SEND is still delivered. */
 #define NO_RECV_MS 500u
-
-struct counters {
-    size_t n;
-    char name[MAX_COUNTERS][NAME_LEN];
-    uint64_t value[MAX_COUNTERS];
-};
 
 struct pair {
     struct ibv_context *ctx;
@@ -139,8 +132,8 @@ static int read_counters(const char *device, struct counters *c)
         char path[512];
         char text[32];
         FILE *f;
-        char *end;
-        unsigned long long v;
+        uint64_t v;
+        bool complete;
 
         if (!checked_counter(entry->d_name))
             continue;
@@ -160,20 +153,19 @@ static int read_counters(const char *device, struct counters *c)
             closedir(dir);
             return -1;
         }
+        complete = fgetc(f) == EOF && !ferror(f);
         fclose(f);
-        errno = 0;
-        v = strtoull(text, &end, 10);
-        if (errno != 0 || end == text) {
+        if (!complete || !parse_counter_value(text, &v)) {
             fprintf(stderr, "%s: not a number: %s", path, text);
             closedir(dir);
             return -1;
         }
         memcpy(c->name[c->n], entry->d_name, strlen(entry->d_name) + 1);
-        c->value[c->n] = (uint64_t)v;
+        c->value[c->n] = v;
         c->n++;
     }
     closedir(dir);
-    return 0;
+    return c->n ? 0 : -1;
 }
 
 /* The row's expectation for counter name: exactly 0 when it names none. */
@@ -197,6 +189,11 @@ static int compare_counters(const struct rdma_case *rc,
     int mismatches = 0;
     size_t used = strlen(got);
 
+    if (!counter_sets_match(before, after)) {
+        snprintf(got + used, got_len - used,
+                 "%scounter names changed or invalid", used ? ", " : "");
+        return 1;
+    }
     for (size_t i = 0; i < after->n; i++) {
         uint64_t old = 0;
         uint64_t delta;
@@ -206,7 +203,13 @@ static int compare_counters(const struct rdma_case *rc,
         for (size_t j = 0; j < before->n; j++)
             if (strcmp(before->name[j], after->name[i]) == 0)
                 old = before->value[j];
-        delta = after->value[i] - old;
+        if (!counter_delta(old, after->value[i], &delta)) {
+            mismatches++;
+            snprintf(got + used, got_len - used, "%s%s decreased",
+                     used ? ", " : "", after->name[i]);
+            used = strlen(got);
+            continue;
+        }
         if (delta == 0 && want.delta == 0)
             continue;
         if (want.at_least ? delta < want.delta : delta != want.delta)

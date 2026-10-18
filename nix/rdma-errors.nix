@@ -15,7 +15,10 @@ stdenv.mkDerivation {
   version = "0.1.0";
   src = lib.fileset.toSource {
     root = ../tests/guest;
-    fileset = ../tests/guest/ernic_rdma_errors.c;
+    fileset = lib.fileset.unions [
+      ../tests/guest/ernic_rdma_errors.c
+      ../tests/guest/ernic_counter_snapshot.h
+    ];
   };
   buildInputs = [ rdma-core ];
   buildPhase = ''

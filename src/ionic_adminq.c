@@ -17,6 +17,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -30,200 +31,24 @@
 
 #include "ionic_adminq.h"
 #include "ionic_datapath.h"
+#include "ionic_fault.h"
+#include "ionic_status.h"
 #include "rocm_ernic_compat.h"
 
-/* -------------------------------------------------------------------------
- * ionic_fw.h constants (keep in sync with pinned kernel ref)
- * -------------------------------------------------------------------------
- */
-
-/* Admin WQE stride and header length */
-#define ADMIN_WQE_STRIDE  64
-#define ADMIN_WQE_HDR_LEN 4
-
-/* Admin opcodes (enum ionic_v1_admin_op) */
-enum ionic_v1_admin_op {
-    IONIC_V1_ADMIN_NOOP = 0,
-    IONIC_V1_ADMIN_CREATE_CQ = 1,
-    IONIC_V1_ADMIN_CREATE_QP = 2,
-    IONIC_V1_ADMIN_CREATE_MR = 3,
-    IONIC_V1_ADMIN_STATS_HDRS = 4,
-    IONIC_V1_ADMIN_STATS_VALS = 5,
-    IONIC_V1_ADMIN_DESTROY_MR = 6,
-    /* 7 reserved */
-    IONIC_V1_ADMIN_DESTROY_CQ = 8,
-    IONIC_V1_ADMIN_MODIFY_QP = 9,
-    IONIC_V1_ADMIN_QUERY_QP = 10,
-    IONIC_V1_ADMIN_DESTROY_QP = 11,
-    IONIC_V1_ADMIN_DEBUG = 12,
-    IONIC_V1_ADMIN_CREATE_AH = 13,
-    IONIC_V1_ADMIN_QUERY_AH = 14,
-    IONIC_V1_ADMIN_MODIFY_DCQCN = 15,
-    IONIC_V1_ADMIN_DESTROY_AH = 16,
-    IONIC_V1_ADMIN_QP_STATS_HDRS = 17,
-    IONIC_V1_ADMIN_QP_STATS_VALS = 18,
-    /* 19-25 reserved upstream for series in flight (RCQ and friends); the
-     * SRQ opcodes were assigned explicitly at 26 and must keep those
-     * numbers. See enum ionic_v1_admin_op in the kernel's ionic_fw.h. */
-    IONIC_V1_ADMIN_CREATE_SRQ = 26,
-    IONIC_V1_ADMIN_MODIFY_SRQ = 27,
-    IONIC_V1_ADMIN_QUERY_SRQ = 28,
-    IONIC_V1_ADMIN_DESTROY_SRQ = 29,
-};
-
-/*
- * ionic_v1_admin_wqe header (4 bytes):
- *   u8  op
- *   u8  rsvd
- *   le16 len   (total byte length of cmd body)
- *
- * Followed by the opcode-specific command body.  A WQE may span multiple
- * 64-byte strides if len+4 > 64.
- *
- * ionic_v1_cqe (32 bytes, big-endian):
- *   For admin CQE type (IONIC_V1_CQE_TYPE_ADMIN = 0):
- *     le16 cmd_idx     — AQ consumer index this completes
- *     u8   cmd_op
- *     u8   rsvd[17]
- *     le16 old_sq_cindex
- *     le16 old_rq_cq_cindex
- *   Followed by (at byte 28):
- *     be32 status_length   (status in high byte when error bit set)
- *     be32 qid_type_flags
- *       bit 0:  color
- *       bit 1:  error
- *       bits[7:5]: type  (0 = admin)
- *       bits[31:8]: qid
- */
-#define CQE_SIZE 32
-
-/* Color bit in qid_type_flags (big-endian byte [3] bit 0). */
-#define CQE_COLOR_BIT 0x01u
-#define CQE_ERROR_BIT 0x02u
-/* Type field bits[7:5] = 0 means admin CQE; we always write 0 there. */
-
-/* -------------------------------------------------------------------------
- * Per-AQ ring state
- * -------------------------------------------------------------------------
- */
-#define MAX_AQ     4
-#define MAX_CQ_MAP 256
-#define MAX_QP_MAP 256
-/* Tied to the advertised ceiling, not merely equal to it today: max_srq comes
- * from IONIC_EMU_SRQ_COUNT, and a map smaller than that silently loses the
- * mappings for every SRQ past the end. */
-#define MAX_SRQ_MAP IONIC_EMU_SRQ_COUNT
-/*
- * One entry per region the rdma_rm table can hold.  At 256 against a
- * 1024-entry table, every MR past the 256th was created successfully and then
- * had no map entry, so DESTROY_MR could not resolve its handle and silently
- * dropped it -- leaking the resource for the lifetime of the process.  An
- * nvme-rdma connect allocates 128 regions per queue, so that ceiling was
- * reached two queues in.
- */
-#define MAX_MR_MAP IONIC_MAX_MR
-
-/* enum ionic_mrf_bits: the low 12 bits are IB access flags. */
-#define IONIC_MRF_ACCESS_MASK 0x0fffu
-
-struct ionic_aq_ring {
-    bool valid;
-
-    /* AQ WQE ring */
-    uint64_t aq_dma;   /* guest PA of WQE ring */
-    uint32_t aq_depth; /* number of entries (2^depth_log2) */
-    uint32_t aq_cons;  /* our consumer index (next WQE to read) */
-    uint32_t aq_prod;  /* last producer index from doorbell write */
-
-    /* Admin CQ ring */
-    uint64_t cq_dma;   /* guest PA of CQE ring */
-    uint32_t cq_depth; /* number of entries */
-    uint32_t cq_prod;  /* our producer index */
-    bool cq_color;     /* current color (flips on ring wrap) */
-    uint32_t aq_id;    /* AQ id the driver knows this ring by */
-    uint32_t cq_id;    /* CQ id the driver knows this ring by */
-    uint32_t eq_id;    /* EQ that carries this CQ's notifications */
-};
-
-struct ionic_adminq_ctx {
-    vfu_ctx_t *vfu_ctx;
-    struct ionic_aq_ring aq[MAX_AQ];
-    int aq_count;
-
-    /* pvrdma handle for calling ionic_rm_* compat wrappers. */
-    pvrdma_handle_t pvrdma_handle;
-
-    /* Bytes a handler DMA'd into the command's response buffer, for the
-     * completion's status_length. Reset before every dispatch; only the
-     * handlers that write a response set it. */
-    uint32_t resp_len;
-
-    /* Raises an EQ event once a CQE has been written. */
-    ionic_adminq_cq_event_fn_t cq_event_fn;
-    void *cq_event_opaque;
-
-    /* The driver names CQs by its own cqid; rdma_rm hands back its own
-     * handles.  CREATE_QP references CQs by cqid, so keep the translation. */
-    struct ionic_cq_map_entry {
-        bool valid;
-        uint32_t cq_id;
-        uint32_t handle;
-    } cq_map[MAX_CQ_MAP];
-
-    /* Same translation for QPs: the driver's qpid vs the backend's QPN. */
-    struct ionic_qp_map_entry {
-        bool valid;
-        uint32_t qp_id;
-        uint32_t qpn;
-    } qp_map[MAX_QP_MAP];
-
-    /* And for MRs: the driver's mrid vs the backend's handle. */
-    struct ionic_mr_map_entry {
-        bool valid;
-        uint32_t mr_id;
-        uint32_t handle;
-    } mr_map[MAX_MR_MAP];
-
-    /*
-     * SRQs differ from every map above: WE pick the id, not the driver.
-     * The LIF identity advertises IONIC_LIF_RDMA_ALLOC_QID_SRQ, which tells
-     * the driver that firmware allocates SRQ qids, so CREATE_SRQ carries the
-     * driver's qid only as a hint and takes the real one out of the DMA'd
-     * response (ionic_controlpath.c: srq->rq.qid = le32_to_cpu(resp_buf->id)).
-     * adminq_alloc_srq() is that allocator, and the slot index below is the
-     * id: see the comment there for why it is not a counter.
-     */
-    struct ionic_srq_map_entry {
-        bool valid;
-        uint32_t srq_id;
-        uint32_t handle;
-        /*
-         * Ours, not the resource manager's. rdma_rm_modify_srq() rejects a
-         * limit of 0 outright (rdma_rm.c), but 0 is the legal value meaning
-         * "no low-watermark", and the guest driver accepts it -- so routing
-         * every limit through the resource manager turned a valid
-         * ibv_modify_srq(srq_limit=0) into an error. The resource manager
-         * never does anything with the value either way: nothing reads it
-         * back except QUERY_SRQ, which now reads this.
-         */
-        uint32_t srq_limit;
-    } srq_map[MAX_SRQ_MAP];
-
-    /* ionic allocates protection domains entirely in the driver, so no PD
-     * ever reaches us.  rdma_rm still needs one, so share a single backend PD
-     * across every QP. */
-    bool pd_valid;
-    uint32_t pd_handle;
-
-    /* Data path that owns the SQ/RQ/CQ rings these commands describe. */
-    struct ionic_datapath *dp;
-};
+#include "ionic_adminq_internal.h"
 
 void ionic_adminq_set_datapath(struct ionic_adminq_ctx *ctx,
                                struct ionic_datapath *dp)
 {
     if (ctx)
         ctx->dp = dp;
+}
+
+void ionic_adminq_set_faults(struct ionic_adminq_ctx *ctx,
+                             struct ionic_fault_set *faults)
+{
+    if (ctx)
+        ctx->faults = faults;
 }
 
 static int adminq_get_pd(struct ionic_adminq_ctx *ctx, uint32_t *pd_handle)
@@ -636,7 +461,7 @@ static int adminq_parse_roce_hdr(struct ionic_adminq_ctx *ctx, uint64_t gpa,
  * -------------------------------------------------------------------------
  */
 
-static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
+void ionic_adminq_post_cqe(struct ionic_adminq_ctx *ctx,
                            struct ionic_aq_ring *r, uint16_t cmd_idx,
                            uint8_t cmd_op, uint8_t status, uint32_t resp_len)
 {
@@ -646,7 +471,8 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
      *   [3:19]  u8   rsvd[17]
      *   [20:21] le16 old_sq_cindex
      *   [22:23] le16 old_rq_cq_cindex
-     *   [24:27] be32 status_length  (status in bits[31:24] when error set)
+     *   [24:27] be32 status_length  (the status code when error is set; the
+     *           driver logs be32_to_cpu() of it as "opcode %u error %u")
      *   [28:31] be32 qid_type_flags (color[0], error[1], type[7:5], qid[31:8])
      */
     uint8_t cqe[CQE_SIZE];
@@ -656,8 +482,8 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
     memcpy(cqe + 0, &ci, 2);
     cqe[2] = cmd_op;
 
-    /* status_length is one field doing two jobs: the status in bits[31:24]
-     * when the error bit is set, and otherwise the number of response bytes
+    /* status_length is one field doing two jobs: the status code itself when
+     * the error bit is set, and otherwise the number of response bytes
      * written. Returning 0 on success is not "no length given" to a driver
      * that reads it -- ionic_create_srq_cmd() compares it against
      * IONIC_ADMIN_CREATE_SRQ_OUT_V1_LEN and reports EOPNOTSUPP when it is
@@ -665,7 +491,7 @@ static void post_admin_cqe(struct ionic_adminq_ctx *ctx,
      * ibv_create_srq() returning "Operation not supported" on a device that
      * had just handled the command. The ops that DMA no response still send
      * 0, which is their correct length. */
-    uint32_t sl = htobe32(status ? ((uint32_t)status << 24) : resp_len);
+    uint32_t sl = htobe32(status ? (uint32_t)status : resp_len);
     memcpy(cqe + 24, &sl, 4);
 
     /* qid_type_flags: bit 0 = color, bit 1 = error, bits[7:5] = type
@@ -1284,6 +1110,165 @@ static uint8_t handle_create_qp_op(struct ionic_adminq_ctx *ctx,
 }
 
 /* -------------------------------------------------------------------------
+ * Hardware statistics
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * STATS_HDRS, STATS_VALS, QP_STATS_HDRS and QP_STATS_VALS share one body,
+ * ionic_admin_stats_hdr (17 bytes):
+ *   le64 dma_addr   [0:7]
+ *   le32 length     [8:11]   (the driver sends PAGE_SIZE)
+ *   le32 id_ver     [12:15]  (0, or the qpid for QP_STATS_VALS)
+ *   u8   type_state [16]
+ *
+ * A HDRS command answers with an array of struct ionic_v1_stat (be32
+ * type_off, char name[28]) that ends at the first entry of type NONE; the
+ * driver reads it into a zeroed page and names its hw_counters files after
+ * the entries.  A VALS command answers with the values at the offsets the
+ * headers gave.  Every value here is an LE64 at an 8-byte aligned offset,
+ * which is what the driver's ionic_v1_stat_val() validates.
+ *
+ * The driver only sends these when the LIF identity advertises
+ * rdma.stats_type (see ionic_eth_emu.c); until it did, a guest had no
+ * hw_counters directory and these opcodes were never reached.
+ */
+
+/*
+ * Write @count headers and the NONE terminator, or as many whole entries as
+ * @length holds.  The driver's buffer is zeroed, so a cut-off terminator
+ * still reads as one.
+ */
+static uint8_t stats_write_hdrs(struct ionic_adminq_ctx *ctx, uint64_t dma,
+                                uint32_t length,
+                                const struct adminq_stat *stats, size_t count)
+{
+    uint8_t buf[(STATS_MAX_COUNT + 1) * STAT_HDR_SIZE];
+    size_t entries = count + 1;
+    size_t fit = length / STAT_HDR_SIZE;
+
+    if (fit == 0)
+        return IONIC_RC_ENOSPC;
+    if (entries > fit)
+        entries = fit;
+
+    memset(buf, 0, sizeof(buf));
+    for (size_t i = 0; i < count && i < entries; i++) {
+        uint32_t type_off = htobe32(STAT_TYPE_LE64 << STAT_TYPE_SHIFT |
+                                    (uint32_t)(i * STAT_VAL_SIZE));
+        size_t name_len = strlen(stats[i].name);
+
+        if (name_len > STAT_NAME_LEN - 1)
+            name_len = STAT_NAME_LEN - 1;
+        memcpy(buf + i * STAT_HDR_SIZE, &type_off, 4);
+        memcpy(buf + i * STAT_HDR_SIZE + 4, stats[i].name, name_len);
+    }
+
+    return dma_write(ctx->vfu_ctx, dma, buf, entries * STAT_HDR_SIZE) < 0
+               ? IONIC_RC_EIO
+               : IONIC_RC_SUCCESS;
+}
+
+/* Write the values the matching headers describe, clamped to @length. */
+static uint8_t stats_write_vals(struct ionic_adminq_ctx *ctx, uint64_t dma,
+                                uint32_t length,
+                                const struct adminq_stat *stats, size_t count,
+                                const void *counters)
+{
+    uint8_t buf[STATS_MAX_COUNT * STAT_VAL_SIZE];
+    size_t n = length / STAT_VAL_SIZE;
+
+    if (n == 0)
+        return IONIC_RC_ENOSPC;
+    if (n > count)
+        n = count;
+
+    memset(buf, 0, sizeof(buf));
+    for (size_t i = 0; i < n; i++) {
+        uint64_t v;
+
+        memcpy(&v, (const uint8_t *)counters + stats[i].off, STAT_VAL_SIZE);
+        v = htole64(v);
+        memcpy(buf + i * STAT_VAL_SIZE, &v, STAT_VAL_SIZE);
+    }
+
+    return dma_write(ctx->vfu_ctx, dma, buf, n * STAT_VAL_SIZE) < 0
+               ? IONIC_RC_EIO
+               : IONIC_RC_SUCCESS;
+}
+
+static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
+                               const uint8_t *body, uint16_t len)
+{
+    uint64_t dma;
+    uint32_t length;
+    uint32_t id_ver;
+
+    if (len < STATS_BODY_LEN) {
+        vfu_log(ctx->vfu_ctx, LOG_ERR, "ionic_adminq stats op=%u: short body",
+                op);
+        return IONIC_RC_EINVAL;
+    }
+    memcpy(&dma, body, 8);
+    dma = le64toh(dma);
+    memcpy(&length, body + 8, 4);
+    length = le32toh(length);
+    memcpy(&id_ver, body + 12, 4);
+    id_ver = le32toh(id_ver);
+    if (!dma) {
+        vfu_log(ctx->vfu_ctx, LOG_ERR, "ionic_adminq stats op=%u: no buffer",
+                op);
+        return IONIC_RC_BAD_ADDR;
+    }
+
+    switch (op) {
+    case IONIC_V1_ADMIN_STATS_HDRS:
+        return stats_write_hdrs(ctx, dma, length, dev_stats, DEV_STATS_COUNT);
+
+    case IONIC_V1_ADMIN_QP_STATS_HDRS:
+        return stats_write_hdrs(ctx, dma, length, qp_stats, QP_STATS_COUNT);
+
+    case IONIC_V1_ADMIN_STATS_VALS: {
+        struct ionic_fault *f =
+            ionic_fault_set_get(ctx->faults, IONIC_FAULT_SITE_STATS_VALS);
+        struct pvrdma_dev_counters c;
+
+        if (ionic_fault_event(f)) {
+            vfu_log(ctx->vfu_ctx, LOG_INFO,
+                    "ionic_adminq STATS_VALS: injected fail status %u "
+                    "(event %" PRIu64 ")",
+                    (unsigned int)f->status, f->eligible);
+            return f->status;
+        }
+        if (pvrdma_get_dev_counters(ctx->pvrdma_handle, &c) != 0)
+            return IONIC_RC_EIO;
+        return stats_write_vals(ctx, dma, length, dev_stats, DEV_STATS_COUNT,
+                                &c);
+    }
+
+    case IONIC_V1_ADMIN_QP_STATS_VALS: {
+        struct pvrdma_qp_counters c;
+        uint32_t qp_id = id_ver & 0x00ffffffu;
+        uint32_t qpn;
+
+        /* Counters are keyed on the driver's qp_id; the map only proves the
+         * QP exists, so a stale id fails rather than reading zeros. */
+        if (!adminq_lookup_qp(ctx, qp_id, &qpn)) {
+            vfu_log(ctx->vfu_ctx, LOG_ERR,
+                    "ionic_adminq QP_STATS_VALS: unknown qp_id=%u", qp_id);
+            return IONIC_RC_ENOENT;
+        }
+        if (pvrdma_get_qp_counters(ctx->pvrdma_handle, qp_id, &c) != 0)
+            return IONIC_RC_EIO;
+        return stats_write_vals(ctx, dma, length, qp_stats, QP_STATS_COUNT, &c);
+    }
+
+    default:
+        return IONIC_RC_EOPCODE;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * WQE dispatch
  * -------------------------------------------------------------------------
  */
@@ -1780,6 +1765,8 @@ static uint8_t dispatch_wqe(struct ionic_adminq_ctx *ctx, uint8_t op,
     case IONIC_V1_ADMIN_STATS_VALS:
     case IONIC_V1_ADMIN_QP_STATS_HDRS:
     case IONIC_V1_ADMIN_QP_STATS_VALS:
+        return handle_stats_op(ctx, op, body, len);
+
     case IONIC_V1_ADMIN_MODIFY_DCQCN:
     case IONIC_V1_ADMIN_DEBUG:
         return 0; /* benign stub */
@@ -1854,7 +1841,7 @@ void ionic_adminq_poll(struct ionic_adminq_ctx *ctx, vfu_ctx_t *vfu_ctx)
             uint16_t cmd_idx = (uint16_t)slot;
             uint8_t status =
                 dispatch_wqe(ctx, op, wqe_buf + ADMIN_WQE_HDR_LEN, len);
-            post_admin_cqe(ctx, r, cmd_idx, op, status, ctx->resp_len);
+            ionic_adminq_post_cqe(ctx, r, cmd_idx, op, status, ctx->resp_len);
             pvrdma_adminq_count(ctx->pvrdma_handle);
 
             /* Never write back to guest WQE memory — the driver owns the ring.
@@ -1866,4 +1853,10 @@ void ionic_adminq_poll(struct ionic_adminq_ctx *ctx, vfu_ctx_t *vfu_ctx)
             processed += strides;
         }
     }
+}
+
+uint8_t ionic_adminq_dispatch(struct ionic_adminq_ctx *ctx, uint8_t op,
+                              const uint8_t *body, uint16_t len)
+{
+    return dispatch_wqe(ctx, op, body, len);
 }

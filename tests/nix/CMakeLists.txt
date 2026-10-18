@@ -76,8 +76,8 @@ ernic_add_fuzz_replay(net_headers)
 # needs no device, and it checks a seed table in LLVMFuzzerInitialize()
 # before replaying.
 ernic_add_fuzz_replay(profile_parse
-    ${CMAKE_SOURCE_DIR}/src/ionic_profile.c
-    ${CMAKE_SOURCE_DIR}/src/ionic_profiles.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_profile.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_profiles.c
 )
 target_compile_definitions(fuzz_replay_profile_parse PRIVATE
     FUZZ_HARNESS_HAS_INITIALIZE
@@ -90,6 +90,31 @@ ernic_add_fuzz_replay(eth_classify
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
 )
 target_compile_definitions(fuzz_replay_eth_classify PRIVATE
+    FUZZ_HARNESS_HAS_INITIALIZE
+)
+
+# The stats harness #includes the admin queue translation unit and the
+# shared fake device from tests/, like tests/test_ionic_stats.c does, and
+# defines LLVMFuzzerInitialize() to check its seed table before replaying.
+ernic_add_fuzz_replay(ionic_stats
+    ${PROJECT_SOURCE_DIR}/src/ionic_adminq.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c)
+target_include_directories(fuzz_replay_ionic_stats PRIVATE
+    ${PROJECT_SOURCE_DIR}/tests
+)
+target_include_directories(fuzz_replay_ionic_stats SYSTEM PRIVATE
+    ${VFIO_USER_INCLUDE_DIRS}
+)
+target_compile_definitions(fuzz_replay_ionic_stats PRIVATE
+    FUZZ_HARNESS_HAS_INITIALIZE
+)
+
+# The fault spec parser is pure string handling; like the stats harness it
+# checks a seed table in LLVMFuzzerInitialize() before replaying.
+ernic_add_fuzz_replay(fault_parse
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
+)
+target_compile_definitions(fuzz_replay_fault_parse PRIVATE
     FUZZ_HARNESS_HAS_INITIALIZE
 )
 
@@ -108,3 +133,19 @@ add_test(
         $<TARGET_FILE:fuzz_replay_profile_parse>
 )
 set_tests_properties(fuzz-seed-files-profile_parse PROPERTIES TIMEOUT 30)
+
+# Check private seed files and rejection of existing filesystem entries.
+add_test(
+    NAME fuzz-seed-files-fault_parse
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_fuzz_seed_files.sh
+        $<TARGET_FILE:fuzz_replay_fault_parse>
+)
+set_tests_properties(fuzz-seed-files-fault_parse PROPERTIES TIMEOUT 30)
+
+# Check private seed files and rejection of existing filesystem entries.
+add_test(
+    NAME fuzz-seed-files-ionic_stats
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_fuzz_seed_files.sh
+        $<TARGET_FILE:fuzz_replay_ionic_stats>
+)
+set_tests_properties(fuzz-seed-files-ionic_stats PROPERTIES TIMEOUT 30)

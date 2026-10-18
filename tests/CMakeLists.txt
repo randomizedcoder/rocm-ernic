@@ -285,6 +285,7 @@ add_executable(test_ionic_intr_pending test_ionic_intr_pending.c
     ${CMAKE_SOURCE_DIR}/src/ionic_profiles.c
     ${PROJECT_SOURCE_DIR}/src/ionic_emu_stats.c
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
 )
 target_include_directories(test_ionic_intr_pending PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -311,6 +312,7 @@ add_executable(test_ionic_port_info test_ionic_port_info.c
     ${CMAKE_SOURCE_DIR}/src/ionic_profiles.c
     ${PROJECT_SOURCE_DIR}/src/ionic_emu_stats.c
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
 )
 target_include_directories(test_ionic_port_info PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -366,6 +368,7 @@ add_executable(test_ionic_identity test_ionic_identity.c
     ${PROJECT_SOURCE_DIR}/src/ionic_profiles.c
     ${PROJECT_SOURCE_DIR}/src/ionic_emu_stats.c
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
 )
 target_include_directories(test_ionic_identity PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -389,6 +392,7 @@ add_executable(test_ionic_stats_publish test_ionic_stats_publish.c
     ${PROJECT_SOURCE_DIR}/src/ionic_profiles.c
     ${PROJECT_SOURCE_DIR}/src/ionic_emu_stats.c
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
 )
 target_include_directories(test_ionic_stats_publish PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -412,6 +416,7 @@ add_executable(test_ionic_queues test_ionic_queues.c
     ${PROJECT_SOURCE_DIR}/src/ionic_profiles.c
     ${PROJECT_SOURCE_DIR}/src/ionic_emu_stats.c
     ${PROJECT_SOURCE_DIR}/src/ionic_eth_steer.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
 )
 target_include_directories(test_ionic_queues PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -436,7 +441,8 @@ target_compile_definitions(test_server_lifecycle PRIVATE _GNU_SOURCE)
 # ionic QUERY_QP test. It #includes the admin queue translation unit to reach
 # dispatch_wqe() and backs the DMA entry points with a plain buffer, so the
 # side buffers the driver reads its answer out of can be inspected directly.
-add_executable(test_ionic_query_qp test_ionic_query_qp.c)
+add_executable(test_ionic_query_qp test_ionic_query_qp.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c)
 target_include_directories(test_ionic_query_qp PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
@@ -453,7 +459,8 @@ target_compile_definitions(test_ionic_query_qp PRIVATE
 # AND the reported length can both be inspected -- the pair that was wrong
 # while CREATE_SRQ wrote an id the driver was never told to read. Also pins
 # the id-map capacity against the advertised max_srq.
-add_executable(test_ionic_srq_adminq test_ionic_srq_adminq.c)
+add_executable(test_ionic_srq_adminq test_ionic_srq_adminq.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c)
 target_include_directories(test_ionic_srq_adminq PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
@@ -464,6 +471,34 @@ target_include_directories(test_ionic_srq_adminq SYSTEM PRIVATE
 )
 target_compile_definitions(test_ionic_srq_adminq PRIVATE
     _GNU_SOURCE)
+
+# ionic hardware statistics test. Compile the admin queue separately and
+# back DMA with a plain buffer, so the
+# header table and values the driver builds hw_counters from can be checked.
+add_executable(test_ionic_stats test_ionic_stats.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_adminq.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c)
+target_include_directories(test_ionic_stats PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_include_directories(test_ionic_stats SYSTEM PRIVATE
+    ${VFIO_USER_INCLUDE_DIRS}
+    ${GLIB2_INCLUDE_DIRS}
+    ${ERNIC_IBVERBS_INCLUDE_DIRS}
+)
+target_compile_definitions(test_ionic_stats PRIVATE
+    _GNU_SOURCE)
+
+# ionic fault-injection core test: the --inject parser, the deterministic
+# patterns and the per-site fault set. Links the translation unit directly;
+# it has no external dependencies to stub.
+add_executable(test_ionic_fault
+    test_ionic_fault.c
+    ${PROJECT_SOURCE_DIR}/src/ionic_fault.c
+)
+target_include_directories(test_ionic_fault PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
 
 # ionic CQ arm-semantics test. It #includes the datapath translation unit to
 # reach the private CQ state and counts the event callback in-process, so no
@@ -775,6 +810,8 @@ set(ERNIC_TEST_TARGETS
     test_ionic_stats_publish
     test_ionic_queues
     test_ionic_query_qp
+    test_ionic_stats
+    test_ionic_fault
     test_server_lifecycle
     test_ionic_srq_adminq
     test_ionic_cq_arm
@@ -1001,6 +1038,24 @@ add_test(
     COMMAND $<TARGET_FILE:test_ionic_query_qp>
 )
 set_tests_properties(ionic-query-qp-unit PROPERTIES TIMEOUT 30)
+
+# ionic hardware statistics unit test: asserts the four stats admin commands
+# answer with the header table and LE64 values the driver turns into its
+# hw_counters files, clamped to the buffer, and fail on an unknown QP.
+add_test(
+    NAME ionic-stats-unit
+    COMMAND $<TARGET_FILE:test_ionic_stats>
+)
+set_tests_properties(ionic-stats-unit PROPERTIES TIMEOUT 30)
+
+# ionic fault-injection unit test: asserts each --inject pattern fires on
+# exactly the events it names, malformed specs are rejected naming the bad
+# token, and the canonical form parses back to the same fault.
+add_test(
+    NAME ionic-fault-unit
+    COMMAND $<TARGET_FILE:test_ionic_fault>
+)
+set_tests_properties(ionic-fault-unit PROPERTIES TIMEOUT 30)
 
 # ionic SRQ adminq unit test: the four SRQ handlers had no in-process
 # coverage, which is how CREATE_SRQ shipped writing its id into a response

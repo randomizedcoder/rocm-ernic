@@ -51,6 +51,8 @@
 #include "ionic_profile.h"
 #include "ionic_datapath.h"
 #include "ionic_adminq.h"
+#include "ionic_status.h"
+#include "ionic_fault.h"
 #include "rocm_ernic_compat.h"
 #include "rocm_ernic_internal.h"
 
@@ -188,10 +190,6 @@ static inline uint64_t le64(uint64_t v)
 #define IONIC_Q_DISABLE 0
 #define IONIC_Q_ENABLE  1
 
-/* Completion status codes (enum ionic_status_code in ionic_if.h) */
-#define IONIC_RC_SUCCESS 0
-#define IONIC_RC_EOPCODE 2
-
 /* LIF capabilities */
 #define IONIC_LIF_CAP_ETH  (1u << 0)
 #define IONIC_LIF_CAP_RDMA (1u << 1)
@@ -212,8 +210,9 @@ static inline uint64_t le64(uint64_t v)
 /* Byte offsets within the rdma section of union ionic_lif_identity. Literal
  * because srq_qtype does not follow the other qtypes contiguously -- see the
  * comment at the write site. */
-#define LIF_ID_SRQ_QTYPE_OFF     96
-#define LIF_ID_ALLOC_QID_CAP_OFF 113
+#define LIF_ID_RDMA_STATS_TYPE_OFF 92
+#define LIF_ID_SRQ_QTYPE_OFF       96
+#define LIF_ID_ALLOC_QID_CAP_OFF   113
 
 /* enum ionic_lif_rdma_alloc_qid: which queue types firmware allocates qids
  * for. CQ is BIT(0) and is not claimed here -- CREATE_CQ still takes the
@@ -240,6 +239,12 @@ static inline uint64_t le64(uint64_t v)
  * we do not handle is how a guest command hangs rather than fails.
  */
 #define IONIC_RDMA_ADMIN_OPCODES 30
+
+/* rdma.stats_type: enum ionic_lif_rdma_stat_type in ionic_if.h.  Without a
+ * bit set the driver never sends STATS_HDRS / QP_STATS_HDRS, so the guest
+ * gets no hw_counters directory and no rdma statistic qp counters. */
+#define IONIC_LIF_RDMA_STAT_GLOBAL 0x1u
+#define IONIC_LIF_RDMA_STAT_QP     0x2u
 
 /* Page table and MR counts for emulated device */
 /* 2M page table entries. This is the knob that sets the guest's maximum
@@ -470,6 +475,9 @@ struct ionic_eth_emu {
     /* In-process endpoint offered every Tx frame before the backend. */
     ionic_eth_tx_filter_fn tx_filter;
     void *tx_filter_ctx;
+    /* Injected faults (ionic_fault.h), or NULL; owned by the caller. */
+    struct ionic_fault *rx_fault;
+    struct ionic_fault *tx_fault;
     /* Staging buffer for one frame in either direction. */
     uint8_t frame[IONIC_ETH_NET_MTU_MAX];
 
@@ -492,6 +500,9 @@ struct ionic_eth_emu {
 struct eth_inbox_frame {
     struct eth_inbox_frame *next;
     size_t len;
+    /* The eth_rx fault has seen it: a frame held back for want of a buffer
+     * is one event, however many polls it waits. */
+    bool fault_seen;
     uint8_t data[];
 };
 
@@ -605,6 +616,15 @@ void ionic_eth_emu_set_profile(struct ionic_eth_emu *emu,
     write_dev_info(emu);
 }
 
+void ionic_eth_emu_set_faults(struct ionic_eth_emu *emu,
+                              const struct ionic_fault_set *faults)
+{
+    if (!emu)
+        return;
+    emu->rx_fault = ionic_fault_set_get(faults, IONIC_FAULT_SITE_ETH_RX);
+    emu->tx_fault = ionic_fault_set_get(faults, IONIC_FAULT_SITE_ETH_TX);
+}
+
 void ionic_eth_emu_destroy(struct ionic_eth_emu *emu)
 {
     if (!emu)
@@ -632,6 +652,7 @@ int ionic_eth_emu_queue_rx_frame(struct ionic_eth_emu *emu, const void *frame,
         return -ENOMEM;
     f->next = NULL;
     f->len = len;
+    f->fault_seen = false;
     memcpy(f->data, frame, len);
 
     pthread_mutex_lock(&emu->inbox_lock);
@@ -1306,6 +1327,11 @@ static void handle_lif_identify(struct ionic_eth_emu *emu, const uint8_t *cmd,
     memcpy(eq + 4, &u, 4);
     u = le32(0);
     memcpy(eq + 8, &u, 4);
+
+    /* stats_type (le16), straight after eq_qtype. */
+    uint16_t stats_type =
+        le16((uint16_t)(IONIC_LIF_RDMA_STAT_GLOBAL | IONIC_LIF_RDMA_STAT_QP));
+    memcpy(rdma + LIF_ID_RDMA_STATS_TYPE_OFF, &stats_type, 2);
 
     /*
      * srq_qtype, and NOT at rdma+32+5*QTYPE_SZ. The five qtypes above are
@@ -2003,6 +2029,11 @@ static void eth_txq_service(struct ionic_eth_emu *emu, uint32_t qid,
         size_t len = eth_tx_gather(emu, q, q->head, &why);
         if (!len) {
             ionic_emu_stats_drop(&emu->stats, NULL, 0, true, why);
+        } else if (ionic_fault_event(emu->tx_fault)) {
+            /* eth_tx drop: lost on the wire, so the guest still gets its
+             * completion and only the drop counters see it. */
+            ionic_emu_stats_drop(&emu->stats, emu->frame, len, true,
+                                 IONIC_EMU_DROP_INJECTED);
         } else {
             bool taken = emu->tx_filter != NULL &&
                          emu->tx_filter(emu->tx_filter_ctx, emu->frame, len);
@@ -2095,6 +2126,22 @@ static int eth_rx_deliver(struct ionic_eth_emu *emu, struct eth_queue *q,
     return 0;
 }
 
+/*
+ * Apply the eth_rx fault to a frame about to be delivered.  Returns true
+ * when the fault fired and the frame is gone.
+ */
+static bool eth_rx_fault(struct ionic_eth_emu *emu, const uint8_t *frame,
+                         size_t len)
+{
+    if (!ionic_fault_event(emu->rx_fault))
+        return false;
+    /* drop: lost before the NIC saw it, so no LIF counter moves. */
+    if (emu->rx_fault->effect == IONIC_FAULT_EFFECT_NOBUF)
+        ionic_emu_stats_drop(&emu->stats, frame, len, false,
+                             IONIC_EMU_DROP_NO_BUFFER);
+    return true;
+}
+
 /* The lif_stats reason for an eth_rx_deliver() error. */
 static enum ionic_emu_drop rx_drop_reason(int rc)
 {
@@ -2157,6 +2204,8 @@ void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
             ionic_eth_net_recv(emu->net, emu->frame, sizeof(emu->frame));
         if (len <= 0)
             break;
+        if (eth_rx_fault(emu, emu->frame, (size_t)len))
+            continue;
 
         uint8_t qid = eth_rx_steer(active, nactive, emu->frame, (size_t)len);
         struct eth_queue *q = &emu->eth_q[IONIC_QTYPE_RXQ][qid];
@@ -2190,6 +2239,11 @@ void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
         pthread_mutex_unlock(&emu->inbox_lock);
         if (!f)
             break;
+        if (!f->fault_seen && eth_rx_fault(emu, f->data, f->len)) {
+            free(f);
+            continue;
+        }
+        f->fault_seen = true;
 
         uint8_t qid = eth_rx_steer(active, nactive, f->data, f->len);
         struct eth_queue *q = &emu->eth_q[IONIC_QTYPE_RXQ][qid];

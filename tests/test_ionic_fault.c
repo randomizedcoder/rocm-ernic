@@ -303,7 +303,8 @@ static const struct fault_case cases[] = {
      SITE "sequence 1x65536 effect explode", .want_err = "unknown effect"},
     {"negative", "bad status after allocating sequence",
      "error and no owned sequence", CHECK_ERROR,
-     SITE "sequence 1,0,1 effect fail status nope", .want_err = "unknown status"},
+     SITE "sequence 1,0,1 effect fail status nope",
+     .want_err = "unknown status"},
 
     /* corner */
     {"corner", "no faults configured",

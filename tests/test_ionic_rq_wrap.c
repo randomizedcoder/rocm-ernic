@@ -250,6 +250,13 @@ void pvrdma_rdma_bytes_count(pvrdma_handle_t handle, uint32_t qp_id,
     (void)bytes;
     (void)op;
 }
+void ionic_eth_emu_count_rdma(struct ionic_eth_emu *emu, uint64_t bytes,
+                              bool is_tx)
+{
+    (void)emu;
+    (void)bytes;
+    (void)is_tx;
+}
 
 /* ---- Harness ----------------------------------------------------------- */
 

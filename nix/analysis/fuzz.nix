@@ -61,8 +61,8 @@ let
       extra = [ "src/ionic_emu_stats.c" "src/ionic_eth_steer.c" ];
       seeds = true; }
     { name = "ionic_stats";
-      extra = [ "src/ionic_fault.c" ];
-      cflags = "-Itests -I${libvfioUser}/include";
+      extra = [ "src/ionic_adminq.c" "src/ionic_fault.c" ];
+      cflags = "-Itests -I${libvfioUser}/include -DERNIC_ADMINQ_TEST";
       seeds = true; }
     { name = "fault_parse";
       extra = [ "src/ionic_fault.c" ];
@@ -84,7 +84,7 @@ let
   '' + lib.optionalString (h.seeds or false) ''
     # The harness checks its seed table at startup and writes it out as a
     # corpus; a failing seed fails the build.
-    FUZZ_EMIT_SEEDS="out/corpus/${h.name}" "out/bin/fuzz_${h.name}" -runs=0
+    (cd "out/corpus/${h.name}" && FUZZ_EMIT_SEEDS=1 "../../bin/fuzz_${h.name}" -runs=0)
   '') harnesses;
 
   # writeShellApplication so it is shellcheck-checked and self-contained

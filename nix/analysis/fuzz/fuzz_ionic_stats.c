@@ -59,6 +59,8 @@
 #include <syslog.h>
 #include <sys/mman.h>
 #include "ionic_adminq_internal.h"
+#include "ionic_fault.h"
+#include "ionic_status.h"
 
 #include "ionic_adminq_fakes.h"
 

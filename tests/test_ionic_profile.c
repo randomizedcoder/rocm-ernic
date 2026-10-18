@@ -568,7 +568,12 @@ static char g_tmpdir[256];
 /* Private, exclusive files even with a permissive caller umask. */
 static FILE *scratch_open(const char *path)
 {
+    /* With _FORTIFY_SOURCE, glibc 2.40 and later give Clang an
+     * open(path, flags, mode) overload, and android-cloexec-open looks for
+     * O_CLOEXEC in its mode */
+    /* NOLINTBEGIN(android-cloexec-open) */
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    /* NOLINTEND(android-cloexec-open) */
     FILE *f;
 
     if (fd < 0)
@@ -700,7 +705,7 @@ static void check_builtin_matches_file(const char *name)
     bool ok = false;
 
     snprintf(path, sizeof(path), "%s/%s.ini", ERNIC_PROFILES_DIR, name);
-    f = fopen(path, "rb");
+    f = fopen(path, "rbe");
     if (f && text) {
         size_t len = 0;
 

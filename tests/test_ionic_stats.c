@@ -316,7 +316,7 @@ static void run_case(const struct stats_case *c)
     g_max = c->max;
     build_body(body, sizeof(body), c->dma, c->length, c->id_ver);
 
-    rc = ionic_adminq_test_dispatch(&g_ctx, c->op, body, c->body_len);
+    rc = ionic_adminq_dispatch(&g_ctx, c->op, body, c->body_len);
     written = bytes_written(c->dma);
     ok = rc == c->want_rc && written == c->want_written &&
          one_write_or_none(c) && content_matches(c);
@@ -440,8 +440,7 @@ static void run_fault_case(const struct fault_case *c)
 
         memset(g_mem, POISON, sizeof(g_mem));
         g_nwrites = 0;
-        got[k] =
-            ionic_adminq_test_dispatch(&g_ctx, c->op, body, STATS_BODY_LEN);
+        got[k] = ionic_adminq_dispatch(&g_ctx, c->op, body, STATS_BODY_LEN);
         got_written[k] = bytes_written(BUF_GPA);
         if (got[k] != c->want_rc[k] || got_written[k] != want)
             ok = false;
@@ -475,7 +474,7 @@ static void check_fault_eligibility(void)
         int snapshot_rc;
         uint8_t rc;
         uint64_t eligible;
-    } cases[] = {
+    } eligible_cases[] = {
         {"positive", "ordinary device values",
          "advances once; next command fires", VALS, 17, BUF_GPA, 40, 0, 0, 1},
         {"negative", "body missing type byte", "EINVAL; pattern unchanged",
@@ -503,7 +502,8 @@ static void check_fault_eligibility(void)
         {"negative", "QP values", "QP values succeed; pattern unchanged",
          QP_VALS, 17, BUF_GPA, 64, 0, 0, 0},
     };
-    for (size_t row = 0; row < sizeof(cases) / sizeof(cases[0]); row++) {
+    for (size_t row = 0;
+         row < sizeof(eligible_cases) / sizeof(eligible_cases[0]); row++) {
         struct ionic_fault_set *set = ionic_fault_set_new();
         struct ionic_fault *fault;
         uint8_t body[64];
@@ -518,29 +518,30 @@ static void check_fault_eligibility(void)
         if (ok && fault) {
             uint8_t rc;
 
-            build_body(body, sizeof(body), cases[row].dma, cases[row].length,
-                       QP_ID | VER1);
-            g_dev_rc = cases[row].snapshot_rc;
-            rc = ionic_adminq_test_dispatch(&g_ctx, cases[row].op, body,
-                                            cases[row].body_len);
-            ok = rc == cases[row].rc &&
-                 fault->eligible == cases[row].eligible && fault->fired == 0;
+            build_body(body, sizeof(body), eligible_cases[row].dma,
+                       eligible_cases[row].length, QP_ID | VER1);
+            g_dev_rc = eligible_cases[row].snapshot_rc;
+            rc = ionic_adminq_dispatch(&g_ctx, eligible_cases[row].op, body,
+                                       eligible_cases[row].body_len);
+            ok = rc == eligible_cases[row].rc &&
+                 fault->eligible == eligible_cases[row].eligible &&
+                 fault->fired == 0;
             g_dev_rc = 0;
             build_body(body, sizeof(body), BUF_GPA, 40, 0);
-            rc = ionic_adminq_test_dispatch(&g_ctx, VALS, body, 17);
-            ok =
-                ok &&
-                rc == (cases[row].eligible ? IONIC_RC_EIO : IONIC_RC_SUCCESS) &&
-                fault->eligible == cases[row].eligible + 1 &&
-                fault->fired == cases[row].eligible;
+            rc = ionic_adminq_dispatch(&g_ctx, VALS, body, 17);
+            ok = ok &&
+                 rc == (eligible_cases[row].eligible ? IONIC_RC_EIO
+                                                     : IONIC_RC_SUCCESS) &&
+                 fault->eligible == eligible_cases[row].eligible + 1 &&
+                 fault->fired == eligible_cases[row].eligible;
         } else {
             ok = false;
         }
         g_ctx.faults = NULL;
         ionic_fault_set_free(set);
         printf("%s %s: %s; expected: %s\n", ok ? "ok" : "FAIL",
-               cases[row].category, cases[row].description,
-               cases[row].expected);
+               eligible_cases[row].category, eligible_cases[row].description,
+               eligible_cases[row].expected);
         if (!ok)
             failures++;
     }
@@ -588,7 +589,7 @@ static void run_cqe_case(const struct cqe_case *c)
     memset(&r, 0, sizeof(r));
     r.cq_dma = CQE_GPA;
     r.cq_depth = 1;
-    ionic_adminq_post_cqe(&g_ctx, &r, 0, VALS, c->status);
+    ionic_adminq_post_cqe(&g_ctx, &r, 0, VALS, c->status, 0);
     memcpy(&sl, g_mem + CQE_GPA + 24, 4);
     memcpy(&qtf, g_mem + CQE_GPA + 28, 4);
     sl = be32toh(sl);
@@ -645,29 +646,30 @@ static void check_golden_headers(void)
         uint8_t opcode;
         const char (*names)[28];
         size_t count;
-    } cases[] = {{"device wire headers", HDRS, device, 5},
-                 {"QP wire headers", QP_HDRS, qp, 8}};
-    for (size_t row = 0; row < sizeof(cases) / sizeof(cases[0]); row++) {
+    } wire_cases[] = {{"device wire headers", HDRS, device, 5},
+                      {"QP wire headers", QP_HDRS, qp, 8}};
+    for (size_t row = 0; row < sizeof(wire_cases) / sizeof(wire_cases[0]);
+         row++) {
         uint8_t body[64];
         bool ok;
 
         ctx_reset();
         build_body(body, sizeof(body), BUF_GPA, 4096, 0);
-        ok = ionic_adminq_test_dispatch(&g_ctx, cases[row].opcode, body, 17) ==
+        ok = ionic_adminq_dispatch(&g_ctx, wire_cases[row].opcode, body, 17) ==
              0;
-        for (size_t i = 0; i <= cases[row].count; i++) {
+        for (size_t i = 0; i <= wire_cases[row].count; i++) {
             uint8_t expected[32] = {0};
 
-            if (i < cases[row].count) {
+            if (i < wire_cases[row].count) {
                 expected[0] = 0x40; /* big-endian type LE64, offset below 256 */
                 expected[3] = (uint8_t)(i * 8);
-                memcpy(expected + 4, cases[row].names[i], 28);
+                memcpy(expected + 4, wire_cases[row].names[i], 28);
             }
             ok = ok && memcmp(g_mem + BUF_GPA + i * 32, expected, 32) == 0;
         }
         printf("%s positive: %s; expected: literal ABI names/type/offset, zero "
                "padding and terminator\n",
-               ok ? "ok" : "FAIL", cases[row].description);
+               ok ? "ok" : "FAIL", wire_cases[row].description);
         if (!ok)
             failures++;
     }
@@ -680,30 +682,30 @@ static void check_alternating_qps(void)
         uint32_t id;
         uint8_t rc;
         uint64_t first;
-    } cases[] = {{"positive: first QP", QP_ID, 0, 0x701},
-                 {"positive: second QP", QP2_ID, 0, 0x901},
-                 {"negative: missing QP", 100, IONIC_RC_ENOENT, 0},
-                 {"corner: first QP again after failure", QP_ID, 0, 0x701},
-                 {"corner: second QP again", QP2_ID, 0, 0x901}};
+    } qp_cases[] = {{"positive: first QP", QP_ID, 0, 0x701},
+                    {"positive: second QP", QP2_ID, 0, 0x901},
+                    {"negative: missing QP", 100, IONIC_RC_ENOENT, 0},
+                    {"corner: first QP again after failure", QP_ID, 0, 0x701},
+                    {"corner: second QP again", QP2_ID, 0, 0x901}};
 
     ctx_reset();
-    for (size_t row = 0; row < sizeof(cases) / sizeof(cases[0]); row++) {
+    for (size_t row = 0; row < sizeof(qp_cases) / sizeof(qp_cases[0]); row++) {
         uint8_t body[64], before[64];
         uint64_t first;
         uint8_t rc;
         bool ok;
 
         memcpy(before, g_mem + BUF_GPA, sizeof(before));
-        build_body(body, sizeof(body), BUF_GPA, 64, cases[row].id | VER1);
-        rc = ionic_adminq_test_dispatch(&g_ctx, QP_VALS, body, 17);
+        build_body(body, sizeof(body), BUF_GPA, 64, qp_cases[row].id | VER1);
+        rc = ionic_adminq_dispatch(&g_ctx, QP_VALS, body, 17);
         memcpy(&first, g_mem + BUF_GPA, 8);
-        ok = rc == cases[row].rc &&
+        ok = rc == qp_cases[row].rc &&
              (rc ? memcmp(before, g_mem + BUF_GPA, sizeof(before)) == 0
-                 : le64toh(first) == cases[row].first);
+                 : le64toh(first) == qp_cases[row].first);
         printf("%s %s; expected: rc %u, own first value %#llx or unchanged "
                "buffer on failure\n",
-               ok ? "ok" : "FAIL", cases[row].description, cases[row].rc,
-               (unsigned long long)cases[row].first);
+               ok ? "ok" : "FAIL", qp_cases[row].description, qp_cases[row].rc,
+               (unsigned long long)qp_cases[row].first);
         if (!ok)
             failures++;
     }

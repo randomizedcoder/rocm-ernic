@@ -761,11 +761,24 @@ static void test_rc(void)
     ih_post_send(h, &r.a, &w);
     expect_send(T, "unsignalled RDMA_WRITE", &r, 0);
 
-    /* A SEND with nothing posted is dropped; the sender still completes */
+    /* A SEND with nothing posted waits behind an RNR, as a connected
+     * requester retries, and goes through once a receive is posted. The
+     * retry timing out is ionic-dp-errors-unit's, which fakes the clock. */
     struct ih_send s = {.op = IH_OP_SEND, .sge = &s1, .nsge = 1};
     ih_post_send(h, &r.a, &s);
-    expect_send(T, "SEND with no receive", &r, 0);
-    check(T, cq_empty(h, &r.cqb), "a SEND with no receive completed one");
+    ih_poll(h);
+    check(T, cq_empty(h, &r.cqa), "a SEND with no receive completed");
+    uint8_t late = 0;
+    struct ih_sge into_late = {.va = VA_B + 16, .len = 1, .lkey = MR_B};
+    ih_post_recv(h, &r.b, &into_late, 1);
+    ih_poll(h);
+    expect_send(T, "SEND retried once a receive is posted", &r, 0);
+    struct ih_cqe le;
+    check(T, ih_cq_poll(h, &r.cqb, &le) && !le.error,
+          "the retried SEND's receive did not complete");
+    ih_mr_read(h, &r.mrb, VA_B + 16, &late, 1);
+    check(T, late == one, "the retried SEND delivered %#x, not %#x",
+          (unsigned)late, (unsigned)one);
 
     /* Bus addresses (lkey 0) across a guest DMA region boundary take more
      * than one scatter/gather entry on both sides */

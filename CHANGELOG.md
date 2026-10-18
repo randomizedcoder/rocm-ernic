@@ -109,6 +109,13 @@
   `stats_type`, and the STATS_HDRS, STATS_VALS, QP_STATS_HDRS and
   QP_STATS_VALS admin commands are implemented; before, the driver created no
   counters at all.
+* The ionic NIC's `hw_counters` include the 30 RDMA error counters the real
+  firmware reports, such as `req_rx_cqe_err`, `resp_rx_out_of_buffer`,
+  `req_rx_rnr_retry_err` and `resp_tx_remote_access_err`, for the device and
+  for each QP. A QP's counters start again at 0 when it is re-created.
+  `ernic-rdma-errors` (`nix build .#ernic-rdma-errors`, or the CMake target),
+  run in a guest, makes each of these errors happen and checks that its
+  counters moved.
 
 ### Changed
 
@@ -192,6 +199,10 @@
   `run:` steps, the scripts that heredocs feed to a shell (such as the ones
   the system tests run in their guests), and the workflow `run:` blocks
   that GitHub runs under `sh`. It needs PyYAML.
+* A local RC SEND that finds no posted receive now waits, as a real
+  requester retries behind an RNR NAK, for up to 5 seconds before failing
+  with an RNR-retry-exceeded completion. It used to be dropped at once, with a
+  successful completion. UD and GSI sends with no receive are still dropped.
 
 ### Removed
 

@@ -1216,16 +1216,18 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
         return stats_write_hdrs(ctx, dma, length, qp_stats, QP_STATS_COUNT);
 
     case IONIC_V1_ADMIN_STATS_VALS: {
-        struct pvrdma_dev_counters c;
+        struct adminq_dev_vals v;
 
-        if (pvrdma_get_dev_counters(ctx->pvrdma_handle, &c) != 0)
+        memset(&v, 0, sizeof(v));
+        if (pvrdma_get_dev_counters(ctx->pvrdma_handle, &v.pv) != 0)
             return 1;
+        ionic_datapath_rdma_counters(ctx->dp, IONIC_DP_DEVICE, v.rdma);
         return stats_write_vals(ctx, dma, length, dev_stats, DEV_STATS_COUNT,
-                                &c);
+                                &v);
     }
 
     case IONIC_V1_ADMIN_QP_STATS_VALS: {
-        struct pvrdma_qp_counters c;
+        struct adminq_qp_vals v;
         uint32_t qp_id = id_ver & 0x00ffffffu;
         uint32_t qpn;
 
@@ -1236,9 +1238,11 @@ static uint8_t handle_stats_op(struct ionic_adminq_ctx *ctx, uint8_t op,
                     "ionic_adminq QP_STATS_VALS: unknown qp_id=%u", qp_id);
             return 1;
         }
-        if (pvrdma_get_qp_counters(ctx->pvrdma_handle, qp_id, &c) != 0)
+        memset(&v, 0, sizeof(v));
+        if (pvrdma_get_qp_counters(ctx->pvrdma_handle, qp_id, &v.pv) != 0)
             return 1;
-        return stats_write_vals(ctx, dma, length, qp_stats, QP_STATS_COUNT, &c);
+        ionic_datapath_rdma_counters(ctx->dp, qp_id, v.rdma);
+        return stats_write_vals(ctx, dma, length, qp_stats, QP_STATS_COUNT, &v);
     }
 
     default:

@@ -360,6 +360,15 @@ int pvrdma_get_qp_counters(pvrdma_handle_t handle, uint32_t qp_id,
     return 0;
 }
 
+void ionic_datapath_rdma_counters(const struct ionic_datapath *dp,
+                                  uint32_t qp_id,
+                                  uint64_t out[IONIC_DP_RDMA_COUNT])
+{
+    (void)dp;
+    (void)qp_id;
+    memset(out, 0, IONIC_DP_RDMA_COUNT * sizeof(out[0]));
+}
+
 /* ---- Recording SRQ stubs ----------------------------------------------- */
 
 #define SRQ_HANDLE_BASE 100u

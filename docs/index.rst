@@ -80,7 +80,7 @@ a host TAP:
 Acknowledgments
 ---------------
 
-The RDMA device logic in ``third-party/qemu/`` is adapted from the
+The RDMA device logic in ``src/qemu/`` is adapted from the
 QEMU PVRDMA implementation. The original authors of that work:
 
 - Yuval Shaia <yuval.shaia@oracle.com> (Oracle)
@@ -94,11 +94,15 @@ under the
 `MIT license <https://github.com/ROCm/rocm-ernic/blob/develop/LICENSE.md>`_.
 The emulator itself is ``GPL-2.0-or-later``:
 
-- Everything under ``src/``, ``tests/`` and ``third-party/``, and the fuzz
-  harnesses in ``nix/analysis/fuzz/``, which build against ``src/``.
-- The VMware/Linux uAPI headers under
-  ``third-party/qemu/include/standard-headers/`` are instead
-  dual ``GPL-2.0`` / ``BSD-2-Clause``.
+- Everything under ``src/`` and ``tests/``, and the fuzz harnesses in
+  ``nix/analysis/fuzz/``, which build against ``src/``.
+- The VMware/Linux uAPI header ``src/qemu/vmw_pvrdma-abi.h`` is
+  instead dual ``GPL-2.0`` / ``BSD-2-Clause``.
+
+The patches under ``patches/`` modify the Linux ionic drivers and
+rdma-core's ionic provider, and are licensed under the terms of the files
+they modify: mostly ``GPL-2.0`` for the kernel drivers and
+``GPL-2.0 OR Linux-OpenIB`` for rdma-core.
 
 The groupings above are a summary; the per-file ``SPDX-License-Identifier``
 notice is authoritative. See

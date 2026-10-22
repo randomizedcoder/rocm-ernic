@@ -13,9 +13,9 @@
  * socketpair and asserts every byte past num_nodes is zero. Without the
  * zero-fill the poison shows up on the wire and the test fails.
  *
- * The static function is reached by #including the translation unit; the
- * broadcast path only needs the mesh/connection hash tables, so the rest of
- * the backend's externals are stubbed out.
+ * The test links rdma_backend_tcp.c and reaches the broadcast through
+ * rdma_backend_tcp_priv.h; the broadcast path only needs the mesh/connection
+ * hash tables, so the rest of the backend's externals are stubbed out.
  *
  * Table-driven: empty mesh (every slot unused), single node, a few nodes, and
  * a full mesh (no tail at all).
@@ -27,6 +27,9 @@
  * See the LICENSE_GPL.md file in the top-level directory.
  */
 
+#include <arpa/inet.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,10 +39,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "rocm-ernic-warnings.h"
+#include <glib.h>
 
-/* Pull in the code under test (including its static functions) */
-#include "rdma/rdma_backend_tcp.c"
+#include "qemu/error-report.h"
+#include "qemu/thread.h"
+#include "rdma/rdma_backend_tcp_priv.h"
 
 /* ---- Stubs for the TU's external symbols -------------------------------
  * None of these are reachable from the topology-broadcast path; they exist
@@ -57,65 +61,17 @@ void info_report(const char *fmt, ...)
 {
     (void)fmt;
 }
-int qemu_thread_create(QemuThread *thread, const char *name,
-                       void *(*start_routine)(void *), void *arg, int mode)
+int qemu_thread_create(QemuThread *thread, void *(*start_routine)(void *),
+                       void *arg)
 {
     (void)thread;
-    (void)name;
     (void)start_routine;
     (void)arg;
-    (void)mode;
     return 0;
-}
-void qemu_thread_exit(void *retval)
-{
-    (void)retval;
-    abort();
 }
 void qemu_thread_join(QemuThread *thread)
 {
     (void)thread;
-}
-void *pci_dma_map(PCIDevice *dev, uint64_t addr, uint64_t *len, int dir)
-{
-    (void)dev;
-    (void)addr;
-    (void)len;
-    (void)dir;
-    return NULL;
-}
-void pci_dma_unmap(PCIDevice *dev, void *buffer, uint64_t len, int dir,
-                   uint64_t access_len)
-{
-    (void)dev;
-    (void)buffer;
-    (void)len;
-    (void)dir;
-    (void)access_len;
-}
-int pci_dma_sync(PCIDevice *dev, uint64_t guest_addr, uint64_t len)
-{
-    (void)dev;
-    (void)guest_addr;
-    (void)len;
-    return 0;
-}
-void rdma_backend_complete_work(enum ibv_wc_status status, uint32_t vendor_err,
-                                uint32_t byte_len, uint32_t qp_num,
-                                enum ibv_wc_opcode opcode, void *ctx)
-{
-    (void)status;
-    (void)vendor_err;
-    (void)byte_len;
-    (void)qp_num;
-    (void)opcode;
-    (void)ctx;
-}
-RdmaRmMR *rdma_rm_get_mr(RdmaDeviceResources *dev_res, uint32_t mr_handle)
-{
-    (void)dev_res;
-    (void)mr_handle;
-    return NULL;
 }
 
 /* ---- Test helpers ------------------------------------------------------ */
@@ -161,31 +117,15 @@ static int read_exact(int fd, void *buf, size_t len)
 #define POISON_STACK_SZ (1024 * 1024)
 
 /*
- * ASan's use-after-return detection relocates large frames off the real
- * stack into freshly-zeroed heap "fake stacks", which would hide the poison
- * and make this test vacuously pass. Turn it off for this binary; the
- * address/leak checks the project cares about here are unaffected.
- *
- * The runtime looks this hook up by name, so the reserved identifier is
- * unavoidable.
- */
-ROCM_ERNIC_WARN_RESERVED_IDENTIFIER_OFF
-const char *__asan_default_options(void);
-const char *__asan_default_options(void)
-{
-    return "detect_stack_use_after_return=0";
-}
-ROCM_ERNIC_WARN_RESERVED_IDENTIFIER_ON
-
-/*
  * Address of a local in the broadcast thread's frame, recorded so the caller
  * can prove the payload really landed on the stack we poisoned.
  *
- * __asan_default_options() above is only a *default*: an ASAN_OPTIONS in the
- * environment overrides it, ASan moves the ~17 KB frame to a freshly-zeroed
- * fake stack, and the tail then reads as zero no matter what the code under
- * test does -- the test would pass vacuously. Checking where the frame landed
- * turns that silent hole into a loud failure.
+ * ASan's use-after-return detection relocates large frames off the real
+ * stack into freshly-zeroed heap "fake stacks", which would hide the poison
+ * and make this test vacuously pass: the ~17 KB frame's tail would read as
+ * zero no matter what the code under test does. tests/CMakeLists.txt builds
+ * this binary without that instrumentation. Checking where the frame landed
+ * keeps a build that has it anyway from passing silently.
  */
 static uintptr_t broadcast_frame;
 
@@ -246,7 +186,7 @@ static void fill_mesh(GHashTable *mesh_nodes, uint32_t n)
         char hostname[64];
         snprintf(hostname, sizeof(hostname), "node-%u.example", i);
         MeshNodeInfo *node =
-            mesh_node_info_new(i + 100, hostname, (uint16_t)(9000 + i));
+            tcp_mesh_node_info_new(i + 100, hostname, (uint16_t)(9000 + i));
         g_hash_table_insert(mesh_nodes, GUINT_TO_POINTER(i + 100), node);
     }
 }
@@ -258,7 +198,7 @@ static void empty_mesh(GHashTable *mesh_nodes)
 
     g_hash_table_iter_init(&iter, mesh_nodes);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
-        mesh_node_info_free((MeshNodeInfo *)value);
+        tcp_mesh_node_info_free((MeshNodeInfo *)value);
     }
     g_hash_table_remove_all(mesh_nodes);
 }
@@ -279,17 +219,20 @@ static int run_case(const struct testcase *tc)
 
     memset(&priv, 0, sizeof(priv));
     priv.is_manager = true;
-    priv.local_node_id = 1;
+    atomic_store(&priv.local_node_id, 1);
     priv.mesh_nodes = g_hash_table_new(g_direct_hash, g_direct_equal);
     priv.connections = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_mutex_init(&priv.mesh_table_lock);
     qemu_mutex_init(&priv.conn_table_lock);
+    qemu_mutex_init(&priv.topology_broadcast_lock);
 
     /* One "worker" on the near end of the socketpair */
     memset(&conn, 0, sizeof(conn));
     conn.node_id = 42;
     conn.sockfd = sv[0];
-    conn.is_connected = true;
+    /* The fixture's own reference: a lookup's ref and unref can't free it */
+    atomic_init(&conn.refcount, 1);
+    atomic_store(&conn.is_connected, true);
     conn.priv = &priv;
     qemu_mutex_init(&conn.lock);
     g_hash_table_insert(priv.connections, GUINT_TO_POINTER(42u), &conn);
@@ -372,6 +315,7 @@ out:
     close(sv[0]);
     close(sv[1]);
     qemu_mutex_destroy(&conn.lock);
+    qemu_mutex_destroy(&priv.topology_broadcast_lock);
     qemu_mutex_destroy(&priv.conn_table_lock);
     qemu_mutex_destroy(&priv.mesh_table_lock);
     g_hash_table_destroy(priv.connections);

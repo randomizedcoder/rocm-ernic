@@ -22,12 +22,14 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <limits.h>
-#include <sys/mman.h>
+#include <grp.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/xattr.h>
 #include <syslog.h>
 #include <getopt.h>
-#include <assert.h>
+#include <inttypes.h>
 #include <time.h>
 
 #include <vfio-user/libvfio-user.h>
@@ -41,8 +43,12 @@
 #include "qemu/error-report.h"
 #include "ionic_adminq.h"
 #include "ionic_datapath.h"
+#include "ionic_eth_emu.h"
+#include "ionic_rdma_devcmd.h"
+#include "ionic_profile.h"
 #include "nvmeof_target.h"
 #include "s3_target.h"
+#include "parse_int.h"
 #include "rocm-ernic-warnings.h"
 
 static const char *get_backend_type_base(const char *backend_str);
@@ -81,6 +87,31 @@ static void signal_handler(int signo)
                 /* Signal will cause vfu_run_ctx() to return with EINTR */
             }
         }
+    }
+}
+
+/**
+ * Did vfu_attach_ctx() fail because of the client rather than the server?
+ *
+ * libvfio-user accepts the connection and then negotiates the protocol
+ * version.  If the peer hangs up (ENOMSG, ECONNRESET, EPIPE), gives up
+ * before the accept completes (ECONNABORTED), or sends something that is
+ * not a valid version message (EINVAL, EPROTO), it closes the accepted
+ * socket and leaves the context ready to attach again.  One bad client
+ * must not take the server down with it.
+ */
+static bool attach_error_is_peer(int errnum)
+{
+    switch (errnum) {
+    case ENOMSG:
+    case ECONNRESET:
+    case EPIPE:
+    case ECONNABORTED:
+    case EINVAL:
+    case EPROTO:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -340,6 +371,24 @@ static int pvrdma_device_init(rocm_ernic_dev_t *dev)
 }
 
 /**
+ * Tear down the ionic emulation layer built by ionic_device_init().
+ *
+ * The datapath goes first: it unregisters its mesh receive callback from
+ * the pvrdma backend, and both it and the rdma devcmd hold pointers into
+ * the eth emulator.  Safe to call on a partly built or already torn-down
+ * device; every pointer is cleared.
+ */
+static void ionic_device_fini(rocm_ernic_dev_t *dev)
+{
+    ionic_datapath_destroy(dev->ionic_dp);
+    dev->ionic_dp = NULL;
+    ionic_rdma_devcmd_destroy(dev->ionic_rdma);
+    dev->ionic_rdma = NULL;
+    ionic_eth_emu_destroy(dev->ionic_emu);
+    dev->ionic_emu = NULL;
+}
+
+/**
  * Initialize ionic emulation layer.
  */
 static int ionic_device_init(rocm_ernic_dev_t *dev)
@@ -361,11 +410,11 @@ static int ionic_device_init(rocm_ernic_dev_t *dev)
 
     if (dev->mac_addr_set)
         ionic_eth_emu_set_mac(dev->ionic_emu, dev->mac_addr);
+    ionic_eth_emu_set_profile(dev->ionic_emu, &dev->profile);
 
     dev->ionic_rdma = ionic_rdma_devcmd_create(dev->vfu_ctx);
     if (!dev->ionic_rdma) {
-        ionic_eth_emu_destroy(dev->ionic_emu);
-        dev->ionic_emu = NULL;
+        ionic_device_fini(dev);
         fprintf(stderr, "ionic_device_init: failed to create rdma devcmd\n");
         return -1;
     }
@@ -376,10 +425,7 @@ static int ionic_device_init(rocm_ernic_dev_t *dev)
 
     dev->ionic_dp = ionic_datapath_create(dev->vfu_ctx, dev->ionic_emu);
     if (!dev->ionic_dp) {
-        ionic_rdma_devcmd_destroy(dev->ionic_rdma);
-        ionic_eth_emu_destroy(dev->ionic_emu);
-        dev->ionic_emu = NULL;
-        dev->ionic_rdma = NULL;
+        ionic_device_fini(dev);
         fprintf(stderr, "ionic_device_init: failed to create datapath\n");
         return -1;
     }
@@ -389,18 +435,17 @@ static int ionic_device_init(rocm_ernic_dev_t *dev)
         char err[256] = "";
         const char *opts = strchr(dev->backend_type_str, ':');
 
+        bool attached;
+
         nvmeof_target_cfg_defaults(&cfg);
-        if (!nvmeof_target_cfg_parse(&cfg, opts ? opts + 1 : NULL, err,
-                                     sizeof(err)) ||
-            !ionic_datapath_attach_nvmeof(dev->ionic_dp, &cfg, err,
-                                          sizeof(err))) {
+        attached =
+            nvmeof_target_cfg_parse(&cfg, opts ? opts + 1 : NULL, err,
+                                    sizeof(err)) &&
+            ionic_datapath_attach_nvmeof(dev->ionic_dp, &cfg, err, sizeof(err));
+        free(cfg.file); /* the target keeps its own copy */
+        if (!attached) {
             fprintf(stderr, "nvmeof backend: %s\n", err);
-            ionic_datapath_destroy(dev->ionic_dp);
-            ionic_rdma_devcmd_destroy(dev->ionic_rdma);
-            ionic_eth_emu_destroy(dev->ionic_emu);
-            dev->ionic_dp = NULL;
-            dev->ionic_emu = NULL;
-            dev->ionic_rdma = NULL;
+            ionic_device_fini(dev);
             return -1;
         }
     }
@@ -415,12 +460,7 @@ static int ionic_device_init(rocm_ernic_dev_t *dev)
                                  sizeof(err)) ||
             !ionic_datapath_attach_s3(dev->ionic_dp, &cfg, err, sizeof(err))) {
             fprintf(stderr, "s3 backend: %s\n", err);
-            ionic_datapath_destroy(dev->ionic_dp);
-            ionic_rdma_devcmd_destroy(dev->ionic_rdma);
-            ionic_eth_emu_destroy(dev->ionic_emu);
-            dev->ionic_dp = NULL;
-            dev->ionic_emu = NULL;
-            dev->ionic_rdma = NULL;
+            ionic_device_fini(dev);
             return -1;
         }
     }
@@ -440,7 +480,8 @@ static int ionic_device_init(rocm_ernic_dev_t *dev)
 }
 
 /**
- * Setup PCI configuration for the emulated ionic device
+ * Setup PCI configuration for the emulated ionic device.  Returns 0, or -1
+ * after saying why.
  */
 static int setup_pci_config(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
 {
@@ -450,7 +491,8 @@ static int setup_pci_config(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
     ret =
         vfu_pci_init(vfu_ctx, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL, 0);
     if (ret < 0) {
-        err(EXIT_FAILURE, "vfu_pci_init() failed");
+        warn("vfu_pci_init() failed");
+        return -1;
     }
 
     /* Upstream ionic.ko + ionic_rdma.ko bind to this ID. */
@@ -478,6 +520,8 @@ static int setup_pci_config(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
  *   BAR0 (64-bit): 32 KB device registers (devcmd + MSI-X ctrl),
  *                  with the MSI-X table/PBA above the register window
  *   BAR2 (64-bit): 4 MB doorbell pages (BAR1 is skipped per ionic spec)
+ *
+ * Returns 0, or -1 after saying why.
  */
 static int setup_bars(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
 {
@@ -487,20 +531,26 @@ static int setup_bars(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
      * register window; the register window itself is shadowed inside
      * ionic_eth_emu. */
     dev->bar0_mem = calloc(1, IONIC_BAR0_TOTAL_SIZE - IONIC_BAR0_REGS_SIZE);
-    if (!dev->bar0_mem)
-        err(EXIT_FAILURE, "ionic: Failed to allocate BAR0 MSI-X shadow");
+    if (!dev->bar0_mem) {
+        warn("ionic: Failed to allocate BAR0 MSI-X shadow");
+        return -1;
+    }
 
     ret = vfu_setup_region(
         vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, IONIC_BAR0_TOTAL_SIZE,
         bar0_access, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL, 0, -1, 0);
-    if (ret < 0)
-        err(EXIT_FAILURE, "ionic: Failed to setup BAR0");
+    if (ret < 0) {
+        warn("ionic: Failed to setup BAR0");
+        return -1;
+    }
 
     ret = vfu_setup_region(
         vfu_ctx, VFU_PCI_DEV_BAR2_REGION_IDX, IONIC_BAR2_DB_SIZE, bar2_access,
         VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL, 0, -1, 0);
-    if (ret < 0)
-        err(EXIT_FAILURE, "ionic: Failed to setup BAR2");
+    if (ret < 0) {
+        warn("ionic: Failed to setup BAR2");
+        return -1;
+    }
 
     ernic_startup_report(
         "rocm-ernic: ionic BARs configured: BAR0=%zu (regs=%zu) BAR2=%zu",
@@ -615,6 +665,11 @@ static void usage(const char *progname)
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -s, --socket PATH    Socket path (default: %s)\n",
             DEFAULT_SOCKET_PATH);
+    fprintf(stderr, "  -G, --socket-group GROUP Let this group, a name or a "
+                    "gid, connect to the\n");
+    fprintf(stderr, "                       socket (mode 0660); without it, "
+                    "only its owner\n");
+    fprintf(stderr, "                       and root can (mode 0600)\n");
     fprintf(stderr, "  -b, --backend TYPE   RDMA backend: "
                     "none|loopback|verbs|tcp|nvmeof|s3\n");
     fprintf(stderr, "                       (default: loopback)\n");
@@ -638,44 +693,19 @@ static void usage(const char *progname)
     fprintf(stderr, "                       Pre-create it with: ip tuntap add "
                     "dev IFNAME\n");
     fprintf(stderr, "                       mode tap user $USER\n");
+    fprintf(stderr, "      --nic-profile NAME|PATH  Shape the NIC from a "
+                    "profile (repeatable;\n");
+    fprintf(stderr, "                       later layers win). NAME is a "
+                    "built-in profile\n");
+    fprintf(stderr, "                       (%s); PATH an ini file.\n",
+            ionic_profile_builtin_names());
+    fprintf(stderr, "      --print-profile  Print the merged NIC profile as "
+                    "ini and exit\n");
     fprintf(stderr, "  -h, --help           Show this help message\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Backend Types:\n");
     fprintf(stderr, "  none: No backend (minimal stubs)\n");
     fprintf(stderr, "  loopback: Internal loopback emulation\n");
-    fprintf(stderr, "                    Options (comma-separated):\n");
-    fprintf(stderr,
-            "                      mode=PATTERN  - Data pattern (default: "
-            "preserve)\n");
-    fprintf(stderr,
-            "                        preserve     - Use actual guest data\n");
-    fprintf(stderr, "                        zeros        - Fill with 0x00\n");
-    fprintf(stderr, "                        ones         - Fill with 0xFF\n");
-    fprintf(stderr, "                        increment    - Fill with "
-                    "0x00,0x01,0x02,...\n");
-    fprintf(stderr, "                        decrement    - Fill with "
-                    "0xFF,0xFE,0xFD,...\n");
-    fprintf(stderr, "                        alternate    - Fill with "
-                    "0xAA,0x55,0xAA,...\n");
-    fprintf(stderr,
-            "                        random       - Fill with random data\n");
-    fprintf(stderr,
-            "                      md5           - Compute MD5 hash of data\n");
-    fprintf(stderr, "                    Examples:\n");
-    fprintf(
-        stderr,
-        "                      loopback                    - Use guest data, "
-        "no MD5\n");
-    fprintf(
-        stderr,
-        "                      loopback:mode=preserve      - Use guest data, "
-        "no MD5\n");
-    fprintf(stderr,
-            "                      loopback:mode=random,md5    - Random data "
-            "with MD5\n");
-    fprintf(stderr,
-            "                      loopback:mode=zeros         - All zeros, no "
-            "MD5\n");
     fprintf(stderr, "  verbs: libibverbs hardware backend\n");
     fprintf(stderr, "                    Options (comma-separated):\n");
     fprintf(stderr,
@@ -800,7 +830,8 @@ static const char *get_backend_type_base(const char *backend_str)
  * @device: Output parameter for device name (caller must free)
  * @ethdev: Output parameter for ethdev name (caller must free)
  * @port: Output parameter for port number
- * @return: 0 on success, -1 on error
+ * @return: 0 on success; -1 on error, with *device and *ethdev freed and
+ *          set to NULL
  */
 static int parse_verbs_options(const char *backend_str, char **device,
                                char **ethdev, uint8_t *port)
@@ -831,8 +862,7 @@ static int parse_verbs_options(const char *backend_str, char **device,
             if (!*device) {
                 *device = strdup(token);
                 if (!*device) {
-                    free(options_copy);
-                    return -1;
+                    goto fail;
                 }
             }
         } else {
@@ -846,8 +876,7 @@ static int parse_verbs_options(const char *backend_str, char **device,
                 }
                 *device = strdup(value);
                 if (!*device) {
-                    free(options_copy);
-                    return -1;
+                    goto fail;
                 }
             } else if (!strcmp(key, "ethdev")) {
                 if (*ethdev) {
@@ -855,24 +884,17 @@ static int parse_verbs_options(const char *backend_str, char **device,
                 }
                 *ethdev = strdup(value);
                 if (!*ethdev) {
-                    free(options_copy);
-                    free(*device);
-                    *device = NULL;
-                    return -1;
+                    goto fail;
                 }
             } else if (!strcmp(key, "port")) {
-                int port_val = atoi(value);
-                if (port_val < 1 || port_val > 255) {
+                int port_val;
+                if (!ernic_parse_int(value, &port_val) || port_val < 1 ||
+                    port_val > 255) {
                     fprintf(stderr,
                             "Error: Invalid port number '%s' (must be "
                             "1-255)\n",
                             value);
-                    free(options_copy);
-                    free(*device);
-                    free(*ethdev);
-                    *device = NULL;
-                    *ethdev = NULL;
-                    return -1;
+                    goto fail;
                 }
                 *port = (uint8_t)port_val;
             } else {
@@ -885,6 +907,15 @@ static int parse_verbs_options(const char *backend_str, char **device,
 
     free(options_copy);
     return 0;
+
+fail:
+    /* Hand back nothing, so the caller has nothing to free. */
+    free(options_copy);
+    free(*device);
+    free(*ethdev);
+    *device = NULL;
+    *ethdev = NULL;
+    return -1;
 }
 
 /**
@@ -959,9 +990,13 @@ static int validate_backend_options(rocm_ernic_dev_t *dev)
         char err[256] = "";
         const char *opts = strchr(dev->backend_type_str, ':');
 
+        bool parsed;
+
         nvmeof_target_cfg_defaults(&cfg);
-        if (!nvmeof_target_cfg_parse(&cfg, opts ? opts + 1 : NULL, err,
-                                     sizeof(err))) {
+        parsed = nvmeof_target_cfg_parse(&cfg, opts ? opts + 1 : NULL, err,
+                                         sizeof(err));
+        free(cfg.file); /* only checking the options here */
+        if (!parsed) {
             fprintf(stderr, "Error: nvmeof backend: %s\n", err);
             fprintf(stderr, "  Use: --backend nvmeof[:size=64M][,file=PATH]"
                             "[,bs=512][,nqn=NAME][,ip=ADDR][,port=4420]\n");
@@ -987,8 +1022,245 @@ static int validate_backend_options(rocm_ernic_dev_t *dev)
     return 0;
 }
 
+/* A numeric --socket-group is parsed as a uint32_t, which only fits a gid_t
+ * of that width. */
+_Static_assert(sizeof(gid_t) == sizeof(uint32_t) && (gid_t)-1 > 0,
+               "gid_t must be an unsigned 32-bit type");
+
+/*
+ * Resolve --socket-group: a group name or, failing that, a numeric gid, as
+ * chgrp(1) does.  Any gid but (gid_t)-1 is valid, including those above
+ * INT_MAX; that one tells lchown() to leave the group alone.  Returns false
+ * if it's neither.
+ */
+static bool resolve_group(const char *spec, gid_t *gid)
+{
+    long max = sysconf(_SC_GETGR_R_SIZE_MAX);
+    size_t len = max > 0 ? (size_t)max : 1024;
+    uint32_t n;
+
+    /* The buffer getgrnam_r() needs has no fixed bound, so grow it until
+     * the entry fits, up to a limit no real group comes near. */
+    for (;;) {
+        struct group grp, *found = NULL;
+        char *buf = malloc(len);
+        int rc;
+
+        if (!buf)
+            return false;
+        rc = getgrnam_r(spec, &grp, buf, len, &found);
+        if (rc == 0 && found) {
+            *gid = found->gr_gid;
+            free(buf);
+            return true;
+        }
+        free(buf);
+        if (rc != ERANGE || len >= ((size_t)1 << 20))
+            break;
+        len *= 2;
+    }
+    if (ernic_parse_u32(spec, &n) && n != (uint32_t)(gid_t)-1) {
+        *gid = (gid_t)n;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Give the socket at @path the group @gid (@name, for messages), then mode
+ * 0660 to let that group in.  Prints why and returns false if it can't.
+ */
+static bool socket_set_group(const char *path, const char *name, gid_t gid)
+{
+    if (lchown(path, (uid_t)-1, gid) < 0) {
+        int e = errno;
+
+        fprintf(stderr, "rocm-ernic: cannot give socket %s the group %s: %s\n",
+                path, name, strerror(e));
+        if (e == EPERM)
+            fprintf(stderr, "rocm-ernic: the server has to run as root or "
+                            "be a member of that group\n");
+        return false;
+    }
+    if (chmod(path, 0660) < 0) {
+        fprintf(stderr, "rocm-ernic: cannot make socket %s mode 0660: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Check that exactly the socket's owner, and root, can connect to it, plus
+ * the group @want_gid if it isn't NULL: mode 0600, or 0660 with that group,
+ * and no access ACL.  Whatever is at @path is checked as it is, without
+ * following a symlink.  Prints why and returns false if anyone else may be
+ * able to connect, if the owner or group may not be able to, or if it can't
+ * tell.  On success *st holds what was checked.
+ *
+ * The umask the socket was created under only lets the owner in, and the
+ * kernel applies it to a UNIX socket itself, so the mode check is a
+ * backstop: a default ACL on the directory can only take bits away.  The ACL
+ * is the hole.  A default ACL is copied onto the socket, and a named entry
+ * in it lets that user or group connect whatever the mode says.
+ */
+static bool socket_access_ok(const char *path, const gid_t *want_gid,
+                             struct stat *st)
+{
+    mode_t want_mode = want_gid ? 0660 : 0600;
+
+    if (lstat(path, st) < 0) {
+        fprintf(stderr, "rocm-ernic: cannot stat socket %s: %s\n", path,
+                strerror(errno));
+        return false;
+    }
+    if (!S_ISSOCK(st->st_mode)) {
+        fprintf(stderr, "rocm-ernic: %s is not a socket\n", path);
+        return false;
+    }
+    if ((st->st_mode & 07777) != want_mode) {
+        fprintf(stderr,
+                "rocm-ernic: socket %s is mode %04o, not %04o; a default ACL "
+                "on its directory can do that, so remove it (setfacl -k) or "
+                "use another directory\n",
+                path, (unsigned)(st->st_mode & 07777), (unsigned)want_mode);
+        return false;
+    }
+    if (want_gid && st->st_gid != *want_gid) {
+        fprintf(stderr, "rocm-ernic: socket %s has group %u, not %u\n", path,
+                (unsigned)st->st_gid, (unsigned)*want_gid);
+        return false;
+    }
+
+    /* A file whose ACL says no more than its mode has no ACL stored, and a
+     * file system without ACLs can't have one. */
+    if (lgetxattr(path, "system.posix_acl_access", NULL, 0) >= 0) {
+        fprintf(stderr,
+                "rocm-ernic: socket %s has an ACL, from a default ACL on its "
+                "directory, that may let other users connect; remove the "
+                "default ACL (setfacl -k) or use another directory, and let "
+                "QEMU in with --socket-group\n",
+                path);
+        return false;
+    }
+    if (errno != ENODATA && errno != ENOTSUP) {
+        fprintf(stderr, "rocm-ernic: cannot check the ACL of socket %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Remove a socket left at @path by a server that didn't exit cleanly, so
+ * vfu_create_ctx() can bind there.  Anything else at @path, a symlink
+ * included, is left alone.  Returns true if nothing is at @path now.  Prints
+ * why and returns false if something other than a socket is there, or if it
+ * can't tell or can't remove it.
+ *
+ * The check and the removal both name the entry relative to its directory,
+ * opened once, so changing a component of @path in between can't point the
+ * removal at another directory.  The entry itself can still be replaced in
+ * between, but only by someone who can write to that directory, who could
+ * remove it anyway.
+ *
+ * The directory is opened with O_PATH, which needs no permission on the
+ * directory itself, as binding the socket doesn't: O_RDONLY would refuse one
+ * the server can write and search but not read.  fstatat() and unlinkat()
+ * still check search and write permission.
+ */
+static bool remove_stale_socket(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    /* The directory keeps its trailing slash, so "/x.sock" opens "/". */
+    char *dir = slash ? strndup(path, (size_t)(slash - path) + 1) : strdup(".");
+    struct stat st;
+    bool ok = false;
+    int dfd = -1;
+
+    if (!dir) {
+        fprintf(stderr, "rocm-ernic: out of memory\n");
+        return false;
+    }
+
+    if (*name == '\0') {
+        fprintf(stderr, "rocm-ernic: socket path \"%s\" has no file name\n",
+                path);
+    } else if ((dfd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0) {
+        fprintf(stderr, "rocm-ernic: cannot open socket directory %s: %s\n",
+                dir, strerror(errno));
+    } else if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+        if (errno == ENOENT) {
+            ok = true;
+        } else {
+            fprintf(stderr, "rocm-ernic: cannot check %s: %s\n", path,
+                    strerror(errno));
+        }
+    } else if (!S_ISSOCK(st.st_mode)) {
+        fprintf(stderr,
+                "rocm-ernic: %s exists and isn't a socket; not removing it\n",
+                path);
+    } else if (unlinkat(dfd, name, 0) < 0 && errno != ENOENT) {
+        fprintf(stderr, "rocm-ernic: cannot remove stale socket %s: %s\n", path,
+                strerror(errno));
+    } else {
+        ernic_startup_report("Removed stale socket file: %s", path);
+        ok = true;
+    }
+
+    if (dfd >= 0) {
+        close(dfd);
+    }
+    free(dir);
+    return ok;
+}
+
+/**
+ * Free the device structure and the strings it owns.  Safe on a structure
+ * that was only partly filled in.
+ */
+static void dev_free(rocm_ernic_dev_t *dev)
+{
+    free(dev->stats_file_path);
+    free(dev->bar0_mem);
+    free(dev->backend_device_name);
+    free(dev->backend_eth_device);
+    free(dev->backend_type_str);
+    free(dev);
+}
+
+/**
+ * Tear down everything built on vfu_ctx, and free the device.
+ *
+ * This stops and joins the backend's threads, such as the TCP backend's, so
+ * the process never exits with them still running: exit() isn't thread
+ * safe.  Safe on a device that was only partly built.
+ */
+static void server_teardown(rocm_ernic_dev_t *dev, vfu_ctx_t *vfu_ctx)
+{
+    /* The ionic layer first, while the ctx it was built on and the pvrdma
+     * backend it registered with are both still alive. */
+    ionic_device_fini(dev);
+
+    /* Then the PVRDMA device, and the ctx last. */
+    if (dev->pvrdma_handle) {
+        pvrdma_device_destroy(dev->pvrdma_handle);
+        dev->pvrdma_handle = NULL;
+    }
+
+    vfu_destroy_ctx(vfu_ctx);
+    g_vfu_ctx = NULL;
+
+    dev_free(dev);
+}
+
 /**
  * Main entry point
+ *
+ * Until vfu_ctx exists, no other thread does either, so a failure ends the
+ * process at once.  From then on, a failure goes to fail, which tears the
+ * device down first, and with it the threads ionic_device_init() starts.
  */
 int main(int argc, char *argv[])
 {
@@ -997,14 +1269,21 @@ int main(int argc, char *argv[])
     const char *socket_path = DEFAULT_SOCKET_PATH;
     const char *log_file_path = NULL;
     const char *tap_ifname = NULL;
+    const char *socket_group = NULL;
+    gid_t socket_gid = 0;
     ErnicLogLevel log_level = ERNIC_LOG_WARN;
     bool log_level_set = false;
+    bool print_profile = false;
     int ret, opt;
+
+    /* Long-only options take values past the single-character ones. */
+    enum { OPT_NIC_PROFILE = 0x100, OPT_PRINT_PROFILE };
 
     /* Command-line option definitions */
     static struct option long_options[] = {
         /* Common options */
         {"socket", required_argument, NULL, 's'},
+        {"socket-group", required_argument, NULL, 'G'},
         {"backend", required_argument, NULL, 'b'},
         {"verbose", no_argument, NULL, 'v'},
         {"log-level", required_argument, NULL, 'L'},
@@ -1013,6 +1292,8 @@ int main(int argc, char *argv[])
         {"mac", required_argument, NULL, 'm'},
         {"help", no_argument, NULL, 'h'},
         {"tap", required_argument, NULL, 'T'},
+        {"nic-profile", required_argument, NULL, OPT_NIC_PROFILE},
+        {"print-profile", no_argument, NULL, OPT_PRINT_PROFILE},
         /* Backend-specific options (verbs only) */
         {"device", required_argument, NULL, 'd'},
         {"ethdev", required_argument, NULL, 'e'},
@@ -1028,6 +1309,7 @@ int main(int argc, char *argv[])
     /* Set defaults */
     dev->backend_type_str =
         strdup("loopback"); /* Default to "loopback" backend */
+    ionic_profile_defaults(&dev->profile);
     dev->backend_port_num = 1;
     dev->verbose = false;
     dev->device_initialized = false;
@@ -1042,13 +1324,19 @@ int main(int argc, char *argv[])
     dev->mac_addr[4] = 0x2d;
     dev->mac_addr[5] = 0x6e;
 
-    /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "s:b:vL:S:m:l:hT:", long_options,
+    /* Parse command line options.  getopt_long() keeps its state in globals,
+     * such as optind, so it isn't thread safe, but no other thread has
+     * started yet */
+    /* NOLINTNEXTLINE(concurrency-mt-unsafe) */
+    while ((opt = getopt_long(argc, argv, "s:G:b:vL:S:m:l:hT:", long_options,
                               NULL)) != -1) {
         switch (opt) {
         /* Common options */
         case 's':
             socket_path = optarg;
+            break;
+        case 'G':
+            socket_group = optarg;
             break;
         case 'b':
             free(dev->backend_type_str);
@@ -1062,9 +1350,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Error: Invalid log level: %s\n", optarg);
                 fprintf(stderr,
                         "  Expected one of: none, error, warn, info, debug\n");
-                free(dev->backend_type_str);
-                free(dev);
-                exit(EXIT_FAILURE);
+                dev_free(dev);
+                return EXIT_FAILURE;
             }
             log_level_set = true;
             break;
@@ -1077,44 +1364,59 @@ int main(int argc, char *argv[])
             log_file_path = optarg;
             break;
         case 'm':
-            /* Parse MAC address: format XX:XX:XX:XX:XX:XX */
-            {
-                unsigned int mac[6];
-                int count =
-                    sscanf(optarg, "%02x:%02x:%02x:%02x:%02x:%02x", &mac[0],
-                           &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
-                if (count != 6) {
-                    fprintf(stderr, "Error: Invalid MAC address format: %s\n",
-                            optarg);
-                    fprintf(stderr, "  Expected format: XX:XX:XX:XX:XX:XX\n");
-                    fprintf(stderr, "  Example: --mac 02:00:00:00:00:01\n");
-                    free(dev->backend_type_str);
-                    free(dev);
-                    exit(EXIT_FAILURE);
-                }
-                for (int i = 0; i < 6; i++) {
-                    if (mac[i] > 255) {
-                        fprintf(stderr, "Error: Invalid MAC address byte: %u\n",
-                                mac[i]);
-                        free(dev->backend_type_str);
-                        free(dev);
-                        exit(EXIT_FAILURE);
-                    }
-                    dev->mac_addr[i] = (uint8_t)mac[i];
-                }
-                dev->mac_addr_set = true;
+            if (!ernic_parse_mac(optarg, dev->mac_addr)) {
+                fprintf(stderr, "Error: Invalid MAC address format: %s\n",
+                        optarg);
+                fprintf(stderr, "  Expected format: XX:XX:XX:XX:XX:XX\n");
+                fprintf(stderr, "  Example: --mac 02:00:00:00:00:01\n");
+                dev_free(dev);
+                return EXIT_FAILURE;
             }
+            dev->mac_addr_set = true;
             break;
         case 'T':
             tap_ifname = optarg;
             break;
+        case OPT_NIC_PROFILE: {
+            char profile_err[512];
+
+            if (ionic_profile_apply(&dev->profile, optarg, profile_err,
+                                    sizeof(profile_err)) != 0) {
+                fprintf(stderr, "Error: --nic-profile: %s\n", profile_err);
+                dev_free(dev);
+                return EXIT_FAILURE;
+            }
+            break;
+        }
+        case OPT_PRINT_PROFILE:
+            print_profile = true;
+            break;
         case 'h':
             usage(argv[0]);
-            exit(EXIT_SUCCESS);
+            dev_free(dev);
+            return EXIT_SUCCESS;
         default:
             usage(argv[0]);
-            exit(EXIT_FAILURE);
+            dev_free(dev);
+            return EXIT_FAILURE;
         }
+    }
+
+    if (print_profile) {
+        int need = ionic_profile_format(&dev->profile, NULL, 0);
+        char *text = need >= 0 ? malloc((size_t)need + 1) : NULL;
+
+        if (!text ||
+            ionic_profile_format(&dev->profile, text, (size_t)need + 1) < 0) {
+            fprintf(stderr, "Error: --print-profile: out of memory\n");
+            free(text);
+            dev_free(dev);
+            return EXIT_FAILURE;
+        }
+        fputs(text, stdout);
+        free(text);
+        dev_free(dev);
+        return EXIT_SUCCESS;
     }
 
     /* Log level precedence: --log-level, then --verbose, then the
@@ -1127,22 +1429,36 @@ int main(int argc, char *argv[])
 
     /* Validate backend-specific options */
     if (validate_backend_options(dev) < 0) {
-        free(dev->backend_type_str);
-        free(dev->backend_device_name);
-        free(dev->backend_eth_device);
-        free(dev);
-        exit(EXIT_FAILURE);
+        dev_free(dev);
+        return EXIT_FAILURE;
     }
 
     /* Redirect stdout and stderr to log file if requested */
     if (log_file_path) {
-        int fd = open(log_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        /* dup2() clears close-on-exec on the copies, so stdout and stderr
+         * are still inherited.  With _FORTIFY_SOURCE, glibc 2.40 and later
+         * give Clang an open(path, flags, mode) overload, and
+         * android-cloexec-open looks for O_CLOEXEC in its mode */
+        /* NOLINTBEGIN(android-cloexec-open) */
+        int fd =
+            open(log_file_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        /* NOLINTEND(android-cloexec-open) */
         if (fd < 0) {
             err(EXIT_FAILURE, "Failed to open log file: %s", log_file_path);
         }
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
         close(fd);
+    }
+
+    /* Resolved before the socket exists, so a group that can't be resolved
+     * fails here rather than leaving a socket QEMU can't reach; and after
+     * the log is open, so the reason is in it. */
+    if (socket_group && !resolve_group(socket_group, &socket_gid)) {
+        fprintf(stderr, "Error: --socket-group: no such group: %s\n",
+                socket_group);
+        dev_free(dev);
+        return EXIT_FAILURE;
     }
 
     /* Setup signal handlers */
@@ -1160,6 +1476,8 @@ int main(int argc, char *argv[])
     if (log_file_path) {
         ernic_startup_report("  Log file: %s", log_file_path);
     }
+    ernic_startup_report("  NIC profile: %s (hash 0x%016" PRIx64 ")",
+                         dev->profile.chain, ionic_profile_hash(&dev->profile));
 
     /* Show backend-specific options only for verbs backend */
     if (!strcmp(get_backend_type_base(dev->backend_type_str), "verbs")) {
@@ -1172,27 +1490,59 @@ int main(int argc, char *argv[])
         ernic_startup_report("  IB Port: %u", dev->backend_port_num);
     }
 
-    /* Remove old socket if it exists - try multiple approaches */
-    struct stat st;
-    if (stat(socket_path, &st) == 0) {
-        if (S_ISSOCK(st.st_mode)) {
-            ernic_startup_report("Removing stale socket file: %s", socket_path);
-            if (unlink(socket_path) != 0) {
-                warn("Failed to unlink existing socket");
-            }
-        }
+    /* Binding fails if anything is at the path, so remove a socket that a
+     * server that didn't exit cleanly left there. */
+    if (!remove_stale_socket(socket_path)) {
+        dev_free(dev);
+        return EXIT_FAILURE;
     }
 
-    /* Give the system a moment to release the socket */
-    usleep(100000); /* 100ms */
-
-    /* Create libvfio-user context with non-blocking attach */
+    /* Create libvfio-user context with non-blocking attach.  It binds and
+     * listens on the socket here, creating it with mode 0777 less the umask.
+     * Whoever connects drives the device as the guest's QEMU, and connecting
+     * needs write permission, so the socket is created 0600, for its owner
+     * alone, under a umask that takes the rest away.  Narrowing the mode
+     * afterwards would be too late: a connection queued in between would be
+     * kept.  --socket-group widens it to 0660 below, once the group is the
+     * one asked for.  The umask is per process, so this must stay ahead of
+     * the first thread, and it's restored so the log and stats files get the
+     * caller's. */
+    mode_t old_umask = umask(S_IXUSR | S_IRWXG | S_IRWXO);
     vfu_ctx =
         vfu_create_ctx(VFU_TRANS_SOCK, socket_path, LIBVFIO_USER_FLAG_ATTACH_NB,
                        dev, VFU_DEV_TYPE_PCI);
+    umask(old_umask);
     if (!vfu_ctx) {
         err(EXIT_FAILURE, "vfu_create_ctx() failed");
     }
+
+    /* Check the socket as created: a default ACL on the directory can still
+     * let others in, or keep the owner out.  Refuse to serve it then;
+     * destroying the context closes the listener, so a connection already
+     * queued on it is never accepted.
+     *
+     * With --socket-group, then give the socket that group, and only then
+     * let the group in, so no other group can connect even briefly; and
+     * check it again, as QEMU will find it.  Both changes act on the path,
+     * which is safe only because nobody untrusted can replace entries in the
+     * socket's directory: one they could write to, unless it's sticky like
+     * /tmp, would let them swap in a socket of their own anyway.  (A shared
+     * directory, sticky or not, lets them take the name before the server
+     * starts, which is why docs/usage.rst says to keep the socket out of
+     * one.)  The second check would catch a path that no longer leads to
+     * this socket, but only after the change. */
+    struct stat sock_st;
+
+    if (!socket_access_ok(socket_path, NULL, &sock_st) ||
+        (socket_group &&
+         (!socket_set_group(socket_path, socket_group, socket_gid) ||
+          !socket_access_ok(socket_path, &socket_gid, &sock_st)))) {
+        goto fail;
+    }
+    ernic_startup_report("rocm-ernic: ✓ Socket permissions set to %04o, "
+                         "group %u, for %s",
+                         (unsigned)(sock_st.st_mode & 07777),
+                         (unsigned)sock_st.st_gid, socket_path);
     g_vfu_ctx = vfu_ctx;
     dev->vfu_ctx = vfu_ctx;
 
@@ -1200,11 +1550,14 @@ int main(int argc, char *argv[])
     ret = vfu_setup_log(vfu_ctx, vfu_log_cb,
                         vfu_log_threshold(ernic_log_get_level()));
     if (ret < 0) {
-        err(EXIT_FAILURE, "vfu_setup_log() failed");
+        warn("vfu_setup_log() failed");
+        goto fail;
     }
 
-    if (ionic_device_init(dev) < 0)
-        err(EXIT_FAILURE, "ionic_device_init() failed");
+    if (ionic_device_init(dev) < 0) {
+        warn("ionic_device_init() failed");
+        goto fail;
+    }
 
     /* Set stats file path if provided */
     if (dev->stats_file_path && dev->pvrdma_handle) {
@@ -1213,25 +1566,26 @@ int main(int argc, char *argv[])
                                        dev->backend_type_str);
         pvrdma_set_stats_pci_ids(dev->pvrdma_handle, PCI_VENDOR_ID_PENSANDO,
                                  PCI_DEVICE_ID_AMD_IONIC_ERNIC);
+        char profile_line[IONIC_PROFILE_CHAIN_MAX + 32];
+        snprintf(profile_line, sizeof(profile_line),
+                 "%s (hash 0x%016" PRIx64 ")", dev->profile.chain,
+                 ionic_profile_hash(&dev->profile));
+        pvrdma_set_stats_nic_profile(dev->pvrdma_handle, profile_line);
         ernic_startup_report("rocm-ernic: Statistics will be written to: %s "
                              "(every ~1 second)",
                              dev->stats_file_path);
         pvrdma_write_stats(dev->pvrdma_handle);
     }
 
-    /* Setup PCI configuration */
-    if (setup_pci_config(vfu_ctx, dev) < 0) {
-        err(EXIT_FAILURE, "setup_pci_config() failed");
-    }
-
-    /* Setup BARs */
-    if (setup_bars(vfu_ctx, dev) < 0) {
-        err(EXIT_FAILURE, "setup_bars() failed");
+    /* Setup PCI configuration and BARs, which say why they failed */
+    if (setup_pci_config(vfu_ctx, dev) < 0 || setup_bars(vfu_ctx, dev) < 0) {
+        goto fail;
     }
 
     /* Setup interrupts */
     if (setup_interrupts(vfu_ctx, dev) < 0) {
-        err(EXIT_FAILURE, "setup_interrupts() failed");
+        warn("setup_interrupts() failed");
+        goto fail;
     }
 
     /* Setup DMA callbacks */
@@ -1242,33 +1596,22 @@ int main(int argc, char *argv[])
     ret = vfu_setup_device_dma(vfu_ctx, dma_register_cb, dma_unregister_cb);
 #endif
     if (ret < 0) {
-        err(EXIT_FAILURE, "vfu_setup_device_dma() failed");
+        warn("vfu_setup_device_dma() failed");
+        goto fail;
     }
 
     /* Setup reset callback */
     ret = vfu_setup_device_reset_cb(vfu_ctx, device_reset_cb);
     if (ret < 0) {
-        err(EXIT_FAILURE, "vfu_setup_device_reset_cb() failed");
+        warn("vfu_setup_device_reset_cb() failed");
+        goto fail;
     }
 
     /* Realize the device */
     ret = vfu_realize_ctx(vfu_ctx);
     if (ret < 0) {
-        err(EXIT_FAILURE, "vfu_realize_ctx() failed");
-    }
-
-    /* Set socket permissions to allow non-root QEMU to connect */
-    if (chmod(socket_path, 0666) < 0) {
-        fprintf(stderr,
-                "rocm-ernic: WARNING: Failed to set socket permissions: %s\n",
-                strerror(errno));
-        fprintf(stderr,
-                "rocm-ernic: You may need to manually run: sudo chmod 666 %s\n",
-                socket_path);
-    } else {
-        ernic_startup_report("rocm-ernic: ✓ Socket permissions set to 0666 "
-                             "(rw-rw-rw-) for %s",
-                             socket_path);
+        warn("vfu_realize_ctx() failed");
+        goto fail;
     }
 
     /* Log MAC address if set */
@@ -1286,7 +1629,7 @@ int main(int argc, char *argv[])
         if (!dev->ionic_emu) {
             fprintf(stderr,
                     "rocm-ernic: Ethernet emulation is not initialized\n");
-            exit(EXIT_FAILURE);
+            goto fail;
         }
         char assigned[64] = {0};
         ret = ionic_eth_emu_attach_tap(dev->ionic_emu, tap_ifname, assigned,
@@ -1298,7 +1641,7 @@ int main(int argc, char *argv[])
                     "rocm-ernic: pre-create it with: ip tuntap add dev "
                     "%s mode tap user $USER\n",
                     tap_ifname);
-            exit(EXIT_FAILURE);
+            goto fail;
         }
         ernic_startup_report("rocm-ernic: Ethernet attached to TAP %s",
                              assigned);
@@ -1319,11 +1662,18 @@ int main(int argc, char *argv[])
             } else if (errno == EINTR) {
                 /* Interrupted by signal, check shutdown flag */
                 continue;
+            } else if (attach_error_is_peer(errno)) {
+                ernic_startup_report("rocm-ernic: client dropped during "
+                                     "negotiation (%s); waiting for the next "
+                                     "client",
+                                     strerror(errno));
+                continue;
             }
             vfu_log(vfu_ctx, LOG_ERR,
                     "vfu_attach_ctx() failed with errno=%d: %s", errno,
                     strerror(errno));
-            err(EXIT_FAILURE, "vfu_attach_ctx() failed");
+            warn("vfu_attach_ctx() failed");
+            goto fail;
         }
 
         ernic_startup_report("rocm-ernic: Client connected!");
@@ -1355,9 +1705,6 @@ int main(int argc, char *argv[])
             /* Always iterate once (non-blocking) to process idle callbacks */
             /* Idle sources may not show up in g_main_context_pending() */
             gboolean had_events = g_main_context_iteration(main_context, FALSE);
-
-            if (dev->pvrdma_handle)
-                pvrdma_drain_pending_interrupts(dev->pvrdma_handle);
 
             /* ionic: move frames from the host TAP into the guest Rx ring.
              * This has to happen on this thread: only it may DMA. */
@@ -1446,28 +1793,17 @@ int main(int argc, char *argv[])
     set_signal_handler(SIGINT, SIG_IGN);
     set_signal_handler(SIGTERM, SIG_IGN);
 
-    /* Cleanup */
-    vfu_destroy_ctx(vfu_ctx);
-    g_vfu_ctx = NULL;
-
-    /* Destroy PVRDMA device */
-    if (dev->pvrdma_handle) {
-        pvrdma_device_destroy(dev->pvrdma_handle);
-        dev->pvrdma_handle = NULL;
-    }
-
-
-    free(dev->stats_file_path);
-
-    free(dev->bar0_mem);
-    free(dev->backend_device_name);
-    free(dev->backend_eth_device);
-    free(dev->backend_type_str);
-    free(dev);
-
-    unlink(socket_path);
+    /* Destroying vfu_ctx removes the socket.  Removing it by name again could
+     * remove one that another server has since created there. */
+    server_teardown(dev, vfu_ctx);
 
     ernic_startup_report("rocm-ernic: Shutdown complete");
 
     return EXIT_SUCCESS;
+
+fail:
+    /* Destroying vfu_ctx also removes the socket.  Only a clean shutdown
+     * says "Shutdown complete". */
+    server_teardown(dev, vfu_ctx);
+    return EXIT_FAILURE;
 }

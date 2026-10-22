@@ -14,14 +14,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <errno.h>
-
-#include <vfio-user/libvfio-user.h>
 
 /* Forward declarations */
 typedef struct rocm_ernic_dev rocm_ernic_dev_t;
-typedef uint64_t dma_addr_t;
-typedef uint64_t hwaddr;
 
 /*
  * Opaque handle to RDMA device
@@ -86,8 +81,7 @@ void pvrdma_uar_mmio_count(pvrdma_handle_t handle, bool is_write);
  * pvrdma_irq_count - Record one delivered MSI-X interrupt
  * @handle: Device handle
  *
- * post_interrupt() counts its own; this is for the ionic path, which triggers
- * the vector itself.
+ * The ionic path triggers the vector itself and reports it here.
  */
 void pvrdma_irq_count(pvrdma_handle_t handle);
 
@@ -121,10 +115,10 @@ enum pvrdma_stat_op {
  * @handle: Device handle
  * @qp_id: QP to attribute the bytes to, or PVRDMA_STAT_NO_QP for totals only
  * @bytes: Number of bytes actually moved
- * @op: Operation class
+ * @stat_op: Operation class
  */
 void pvrdma_rdma_bytes_count(pvrdma_handle_t handle, uint32_t qp_id,
-                             uint64_t bytes, enum pvrdma_stat_op op);
+                             uint64_t bytes, enum pvrdma_stat_op stat_op);
 
 /**
  * pvrdma_qp_doorbell_count - Record one doorbell ring against a QP
@@ -166,9 +160,48 @@ void pvrdma_qp_cqe_count(pvrdma_handle_t handle, uint32_t qp_id);
  */
 void pvrdma_qp_stats_forget(pvrdma_handle_t handle, uint32_t qp_id);
 
-/*
- * Command Execution - pvrdma_exec_cmd is declared in pvrdma.h
+/* Device totals, as reported to the guest by the ionic STATS_VALS command. */
+struct pvrdma_dev_counters {
+    uint64_t commands;
+    uint64_t total_bytes_sent;
+    uint64_t total_bytes_received;
+    uint64_t total_bytes_rdma_read;
+    uint64_t total_bytes_rdma_write;
+};
+
+/* One QP's counters, as reported by the ionic QP_STATS_VALS command. */
+struct pvrdma_qp_counters {
+    uint64_t doorbell_send;
+    uint64_t doorbell_recv;
+    uint64_t wqes_processed;
+    uint64_t cqes_posted;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t bytes_rdma_read;
+    uint64_t bytes_rdma_write;
+};
+
+/**
+ * pvrdma_get_dev_counters - Snapshot the device totals
+ * @handle: Device handle
+ * @out: Filled on success, zeroed on failure
+ *
+ * Returns 0, or -EINVAL for a NULL handle or @out.
  */
+int pvrdma_get_dev_counters(pvrdma_handle_t handle,
+                            struct pvrdma_dev_counters *out);
+
+/**
+ * pvrdma_get_qp_counters - Snapshot one QP's counters
+ * @handle: Device handle
+ * @qp_id: QP to read
+ * @out: Filled on success, zeroed on failure
+ *
+ * A QP that has not counted anything yet reads as all zeros; this does not
+ * create an entry for it.  Returns 0, or -EINVAL for a NULL handle or @out.
+ */
+int pvrdma_get_qp_counters(pvrdma_handle_t handle, uint32_t qp_id,
+                           struct pvrdma_qp_counters *out);
 
 /*
  * Statistics
@@ -210,6 +243,14 @@ void pvrdma_set_stats_connection_state(pvrdma_handle_t handle,
                                        const char *connection_str);
 
 /**
+ * pvrdma_set_stats_nic_profile - Set the NIC profile for stats display
+ * @handle:  Device handle
+ * @profile: the profile chain and hash, e.g. "compat (hash 0x...)" (may be
+ *           NULL; shown as "(not set)" in stats file)
+ */
+void pvrdma_set_stats_nic_profile(pvrdma_handle_t handle, const char *profile);
+
+/**
  * pvrdma_inc_stats_reset_count - Increment device reset count for stats
  * @handle: Device handle
  */
@@ -220,22 +261,6 @@ void pvrdma_inc_stats_reset_count(pvrdma_handle_t handle);
  * @handle: Device handle
  */
 void pvrdma_write_stats(pvrdma_handle_t handle);
-
-/*
- * Bridge Functions: DMA and Interrupts
- *
- * These are called FROM QEMU code TO interact with libvfio-user.
- * They need access to vfu_ctx which we get from the device.
- */
-
-/* DMA functions are now pci_dma_map/unmap declared in hw/pci/pci.h */
-
-/**
- * pvrdma_drain_pending_interrupts - deliver any CQ
- * completion interrupts queued by background threads.
- * Must be called from the main (vfio-user) thread.
- */
-void pvrdma_drain_pending_interrupts(pvrdma_handle_t handle);
 
 /*
  * Thin wrappers for the ionic migration path.
@@ -258,6 +283,34 @@ int ionic_rm_alloc_cq(pvrdma_handle_t handle, uint32_t cqe,
  * ionic_rm_dealloc_cq - Free a completion queue
  */
 void ionic_rm_dealloc_cq(pvrdma_handle_t handle, uint32_t cq_handle);
+
+/**
+ * ionic_rm_alloc_srq - Allocate a shared receive queue
+ * @pd_handle: protection domain the SRQ belongs to
+ * @srq_limit: low-watermark at which the device raises an SRQ_LIMIT event
+ * @srq_handle: output: allocated SRQ handle
+ */
+int ionic_rm_alloc_srq(pvrdma_handle_t handle, uint32_t pd_handle,
+                       uint32_t max_wr, uint32_t max_sge, uint32_t srq_limit,
+                       uint32_t *srq_handle);
+
+/**
+ * ionic_rm_dealloc_srq - Free a shared receive queue
+ */
+void ionic_rm_dealloc_srq(pvrdma_handle_t handle, uint32_t srq_handle);
+
+/**
+ * ionic_rm_modify_srq - Change an SRQ's low-watermark
+ */
+int ionic_rm_modify_srq(pvrdma_handle_t handle, uint32_t srq_handle,
+                        uint32_t srq_limit);
+
+/**
+ * ionic_rm_query_srq - Read back an SRQ's attributes
+ */
+int ionic_rm_query_srq(pvrdma_handle_t handle, uint32_t srq_handle,
+                       uint32_t *max_wr, uint32_t *max_sge,
+                       uint32_t *srq_limit);
 
 /**
  * ionic_rm_alloc_pd - Allocate a protection domain
@@ -352,6 +405,80 @@ typedef void (*ionic_mesh_recv_fn)(void *opaque, uint32_t src_node,
  * agree.
  */
 #define IONIC_MESH_MAX_MSG (16u << 20)
+
+/*
+ * SRQ sizing, shared because three places have to agree and nothing else
+ * makes them: ionic_eth_emu.c puts the count in the LIF identity (it
+ * becomes the guest's max_srq verbatim), rdma_backend_tcp.c sizes
+ * rdma_rm's SRQ table from it, and ionic_adminq.c reports the SGE limit
+ * in CREATE_SRQ. A count advertised to the guest but not reflected in the
+ * table is not a smaller ceiling -- it is a table of size zero, so the
+ * first ibv_create_srq() fails EINVAL on a device claiming max_srq=32768.
+ *
+ * 256 because that is what every table behind it can actually hold. This was
+ * 1<<15, which no table matched: ionic_adminq.c tracks the id->handle mapping
+ * in a fixed 256-entry array, so the 257th CREATE_SRQ stored nothing and still
+ * handed the guest an id -- a live SRQ id that no later lookup could resolve.
+ * An advertised ceiling is a promise the admin path has to keep, and the
+ * cheapest way to keep it is to promise what the smallest table holds.
+ *
+ * Raising this is fine, but raise the adminq map with it: that map is scanned
+ * linearly, so a large value wants an indexed lookup rather than a bigger
+ * scan. The ids are dense (IONIC_SRQ_QID_BASE + n), so indexing is easy when
+ * it is needed.
+ */
+#define IONIC_EMU_SRQ_COUNT 256u
+
+/*
+ * SRQ ids start above the QP id space, and they have to.
+ *
+ * There is no separate SRQ doorbell qtype: ionic_post_recv_common() rings
+ * lif_cfg.rq_qtype for an SRQ exactly as it does for a QP's own RQ, so a
+ * qtype-7 doorbell carries either a QP id or an SRQ id and the device has to
+ * tell them apart by the number alone. The two come from different
+ * allocators -- the driver allocates QP ids itself, while SRQ ids are
+ * firmware-assigned (IONIC_LIF_RDMA_ALLOC_QID_SRQ; there is no equivalent
+ * bit for QPs) -- so without a disjoint range they would collide, and an SRQ
+ * doorbell would be credited to whichever QP shared its number.
+ *
+ * The guest's QP ids are bounded by the qp_count in the LIF identity, so
+ * starting SRQ ids at that bound keeps the two apart with no table to
+ * consult.
+ */
+#define IONIC_EMU_QP_COUNT_SHARED (1u << 15)
+#define IONIC_SRQ_QID_BASE        IONIC_EMU_QP_COUNT_SHARED
+
+/* Mirrors IONIC_MAX_SRQ_SGES in the guest driver's ionic_fw.h. */
+#define IONIC_MAX_SRQ_SGES 2
+
+/*
+ * Ceilings for the ring geometry exponents a guest may ask for.
+ *
+ * These are shift counts taken straight off the admin queue, so they are
+ * attacker-controlled in the only sense that matters here: a malformed WQE
+ * reaches them before anything has looked at the values. Shifting a 32-bit
+ * type by 32 or more is undefined in C, so they must be bounded before use,
+ * not merely clamped afterwards.
+ *
+ * DEPTH: 2^16 entries matches the max_srq_wr the device advertises (0xffff),
+ * so no legitimate driver asks for more.
+ *
+ * STRIDE: 2^8. The driver's SRQ WQE is 64 bytes, so this is two doublings
+ * of headroom above anything real, and it fits the WQE buffer the receive
+ * path reads into (rwqe in deliver_recv(), which ionic_datapath.c
+ * static-asserts).
+ *
+ * The stride needs a floor as well as a ceiling, and for a different
+ * reason. deliver_recv() reads min(stride, sizeof rwqe) bytes and then
+ * takes the work request id from offset 0 and the SGE count from offset 9.
+ * A stride below the payload offset leaves those bytes unwritten, so the
+ * receive is driven by whatever was on the stack. 2^5 is that offset --
+ * ionic_datapath.c static-asserts the two agree -- and the driver asks for
+ * 2^6, so this rejects only geometries no real driver requests.
+ */
+#define IONIC_SRQ_MAX_DEPTH_LOG2  16u
+#define IONIC_SRQ_MAX_STRIDE_LOG2 8u
+#define IONIC_SRQ_MIN_STRIDE_LOG2 5u
 
 uint32_t ionic_mesh_local_node(pvrdma_handle_t handle);
 uint32_t ionic_mesh_node_from_gid(pvrdma_handle_t handle,

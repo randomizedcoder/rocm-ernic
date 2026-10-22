@@ -6,6 +6,12 @@
 
 * `-L` / `--log-level` and the `ERNIC_LOG_LEVEL` environment variable select
   the server log verbosity (`none`, `error`, `warn`, `info`, `debug`).
+* `-G` / `--socket-group GROUP` lets the members of a group, given by name
+  or number, connect to the server's vfio-user socket, which it makes mode
+  `0660` with that group before serving it. The server has to run as root or
+  be a member of the group. `ERNIC_SOCKET_GROUP` in `rocm-ernic.env` passes
+  it to every instance the service starts, and to `ernicctl hot-reload`, so
+  a QEMU that doesn't run as root can connect, and still can after a restart.
 * The server presents an AMD Pensando ionic NIC (`1dd8:1002`, subsystem
   `1dd8:5400`) so the guest can use the upstream Linux `ionic` and
   `ionic_rdma` drivers. The guest-side patch in `patches/` is built into a DKMS
@@ -50,7 +56,7 @@
   (`s3-http-unit`), `tests/test_s3_target.c` (`s3-target-unit`),
   `tests/test_s3_tcp.c` (`s3-tcp-unit`) and `tests/test_s3_ci.sh` (`s3-ci`)
   cover the store without needing a VM; `tests/s3_rdma_client.c` is a
-  self-contained libibverbs client built and run inside the guest by
+  libibverbs client built and run inside the guest by
   `ansible/playbooks/s3-tests.yml`, which the hosted `system-test-s3` job runs
   end to end, the `vm-s3` self-hosted job runs via `ci/jobs/vm-s3.sh`, and
   which can be run by hand with `--tags s3`. The hosted lane publishes an
@@ -59,9 +65,101 @@
   launcher picks per instance, which is what selects `nvmeof` for that lane.
 * CI job `ionic-patches` verifies that every patch in `patches/` still applies
   to the pinned `IONIC_KERNEL_REF`.
+* `-DERNIC_USE_CODE_COVERAGE=ON` (Clang only) builds with LLVM source-based
+  coverage, and the `ernic-coverage` target reports the line coverage of
+  `src/` after `ctest`. The Build and Test workflow has a coverage leg that
+  fails below a floor, and on `develop` publishes the figure for the README's
+  Coverage badge.
+* `ernic-test-ionic-harness` (CTest `ionic-harness-*`) runs the whole ionic
+  device in-process, with a fake libvfio-user over heap memory, and drives it
+  the way the guest drivers do: bring-up, the RDMA admin queue, RC and UD
+  transfers, atomics, fast registration, SRQs, CQ events, Ethernet Tx and Rx,
+  and the NVMe-oF connect over GSI. It needs no VM or RDMA device, so the data
+  path is now tested in every CI build leg, sanitizers included. It raises
+  the line coverage of `src/` from about 51% to about 67%, and the coverage
+  leg's floor goes from 45% to 60%.
+* `-DERNIC_USE_IWYU=ON` runs include-what-you-use on rocm-ernic's own sources
+  as they compile, which prints suggestions for `#include` lines to add or
+  remove. The suggestions don't fail the build. It is best built with the
+  clang that IWYU is built on. The new IWYU workflow runs it on every change
+  to the C sources and lists the suggestions, failing only if IWYU itself
+  fails.
+* `-DERNIC_USE_CLANG_TIDY=ON` runs clang-tidy on rocm-ernic's own sources as
+  they compile, with the checks in the new `.clang-tidy`, and fails the build
+  on any finding. It needs clang-tidy 19 or later, and Clang as the C
+  compiler. `.clang-tidy` enables every group of checks that applies to
+  rocm-ernic and, for now, turns off the checks the current code doesn't
+  pass. The new clang-tidy workflow runs it with clang-tidy 23 in
+  Debug and Release on every change to the C sources.
+* rocm-ernic can be built as part of another CMake project with
+  `add_subdirectory()`. When it is, it leaves the build type to the parent
+  project instead of defaulting it to `Debug`. The CTest `cmake-subproject`
+  test builds the server this way.
+* The Build and Test workflow's GCC Debug leg without sanitizers also runs
+  the tests under valgrind's memcheck, which finds reads of uninitialized
+  memory, including uninitialized bytes passed to a system call such as
+  `send()`, that the sanitizers don't look for. A test fails on any
+  valgrind error, or on a leak that's definitely or possibly lost. The
+  tests that start the server, and `tests/test_loopback_ci.sh`, run with
+  the server itself under valgrind. The test scripts run it under the
+  command in the new `ERNIC_TEST_SERVER_WRAPPER` environment variable, if
+  that's set, and `test_server_lifecycle` runs under valgrind with
+  `--trace-children=yes`, which follows it into each server it starts.
+  The tests that only run a script or CMake are left out.
+  `tcp-thread-stop-unit` skips its out-of-descriptors row under valgrind,
+  which it detects with `<valgrind/valgrind.h>` when that's installed.
+* `tests/py/` drives real server processes over the vfio-user socket from
+  Python, the way a VMM does, with no VM, RDMA hardware, root, or package
+  outside the standard library. Guest memory is a `memfd` the client maps and
+  the server maps too, so the real DMA path runs. Three suites are registered
+  with CTest: `ernic-vfu-client` (the vfio-user protocol, and the offsets,
+  counts, addresses and interrupt ranges a client must not get away with),
+  `ernic-ionic-driver` (device bring-up, queue pairs, memory regions, work
+  requests and completions, through a server process rather than the
+  in-process harness) and `ernic-mesh-stress` (a three-node mesh under
+  traffic between every pair of nodes, peers sending frames no real node
+  sends, the protocol version gate in both directions, and nodes killed and
+  restarted while the manager's descriptors are counted). They honour
+  `ERNIC_TEST_SERVER_WRAPPER`, so the valgrind leg covers them too, and
+  `test_mesh_stress.py --size N` varies the mesh. They need python3, which
+  the shell suites already needed. Documented in `docs/testing.rst`.
+* Nix outputs for running the emulated NIC under a NixOS guest:
+  `nixosModules.ernic-guest` (enable with `virtualisation.ernic.enable`)
+  gives a `qemu-vm.nix` guest shared memory, a q35 root port, vfio-user-pci
+  and the in-tree ionic drivers; `packages.<system>.ernic-run` starts the
+  server around a VM launcher, exports `ERNIC_SOCKET`, and stops the server
+  when the launcher exits, passing on its exit code. On x86_64 hosts,
+  `nix run .#ionic-vm` boots such a guest to a root shell
+  (`--ssh-port N` forwards ssh), and `nix run .#run-ionic-guest-test` checks
+  that the guest's RDMA port reaches `PORT_ACTIVE`. The Nix Check workflow
+  builds the new `launchers` check, which tests `ernic-run` and the module's
+  assertions without a VM. Documented in `nix/README.md`.
+* Guests running the in-tree `ionic_rdma` driver get a `hw_counters`
+  directory under `/sys/class/infiniband/<dev>/ports/1/`, with device and
+  per-QP counters (commands, bytes sent and received, RDMA read and write
+  bytes, doorbells, WQEs and CQEs). The LIF identity now advertises
+  `stats_type`, and the STATS_HDRS, STATS_VALS, QP_STATS_HDRS and
+  QP_STATS_VALS admin commands are implemented; before, the driver created no
+  counters at all.
+* `--nic-profile NAME|PATH` (repeatable, later layers win per key) chooses
+  what the emulated ionic NIC looks like to the guest: its identity (ASIC
+  type and revision, firmware version) and link (speed, transceiver, maximum
+  MTU). Profiles are ini files; `compat` (the default, byte-identical to the
+  device before profiles) and `small-vm` are built in, and their sources are
+  in `profiles/`. `--print-profile` prints the resolved profile and exits, and
+  the startup log and stats file name the profile chain and its hash. An
+  unknown key or out-of-range value is an error naming the file, line and
+  key. Documented in `docs/ionic.rst`.
 
 ### Changed
 
+* The QEMU-derived PVRDMA resource manager and backend device moved from
+  `third-party/qemu/` to `src/qemu/`, with its `hw/rdma/` and `include/`
+  subdirectories flattened into it, and `third-party/` is gone. The code
+  is no longer treated as vendored: it's compiled with the project's
+  warnings, so `ERNIC_WERROR` covers it, clang-tidy, IWYU and codespell
+  check it, and it counts toward the coverage floor. Local branches and
+  patches that touch it need their paths updated.
 * The emulated device now identifies as `1dd8:1002` with subsystem
   `1dd8:5400`, rather than `1022:8001`. A guest image built for an older
   release needs its udev rules updated to match and should refresh `pci.ids`
@@ -87,6 +185,115 @@
   `ernic_vms_total` is now `ernic_vms`. They count what exists right now, not
   a running total. The shipped dashboard is updated; hand-written dashboards,
   alerts and recording rules referring to the old names must be changed.
+* The tests are only built when `BUILD_TESTING` is on, which it is by
+  default. `-DBUILD_TESTING=OFF` builds just the server.
+* The CMake cache variables that hold the git SHA built into the server are
+  now `ERNIC_GIT_SHA_FULL` and `ERNIC_GIT_SHA_SHORT`, rather than
+  `GIT_SHA_FULL` and `GIT_SHA_SHORT`, so they can't collide with a parent
+  project's.
+* The server and tests are linked with the OpenSSF hardening options whenever
+  the linker supports them: as position-independent executables, with full
+  RELRO (`-z relro -z now`), a non-executable stack (`-z noexecstack`), and
+  `--as-needed --no-copy-dt-needed-entries`. Ubuntu's GCC already did all of
+  this by default, but other toolchains, such as upstream Clang, didn't.
+* `ERNIC_USE_SANITIZERS` now builds with every sanitizer except
+  ThreadSanitizer that the compiler supports and that can be combined with
+  AddressSanitizer: AddressSanitizer (including LeakSanitizer),
+  UndefinedBehaviorSanitizer, and the `float-divide-by-zero` check, plus
+  `bounds-strict`, `float-cast-overflow`, `pointer-compare`, and
+  `pointer-subtract` with GCC, or `implicit-conversion`, `local-bounds`, and
+  `nullability` with Clang. Configuring fails if the C compiler isn't GCC or
+  Clang, or can't build a program with the sanitizers.
+* The unit tests are no longer built with AddressSanitizer and the other
+  `ERNIC_USE_SANITIZERS` sanitizers in every build. Like the server, they're
+  only built with sanitizers when `ERNIC_USE_SANITIZERS` or
+  `ERNIC_USE_THREAD_SANITIZER` is on, so configuring with the tests no longer
+  needs the compiler's sanitizer runtimes. Build with those options to run
+  the tests under the sanitizers, as CI does.
+* Every sanitizer report is now fatal, so `UBSAN_OPTIONS=halt_on_error=1` and
+  `TSAN_OPTIONS=halt_on_error=1` are no longer needed. The programs that
+  rocm-ernic builds set some sanitizer run-time options themselves, such as
+  the one that turns on GCC's `pointer-compare` and `pointer-subtract`
+  checks, which the `ASAN_OPTIONS`, `UBSAN_OPTIONS`, and `TSAN_OPTIONS`
+  environment variables override.
+* The new `ERNIC_SANITIZER_SHARED_RUNTIME` option selects whether sanitizer
+  builds link the shared sanitizer runtime, so that they can load libraries
+  from another sanitizer build, or the static one. It defaults to what the
+  compiler does on its own, `ON` with GCC and `OFF` with Clang. With Clang
+  and `ON`, the programs get an RPATH to the runtime's directory.
+* The Ansible Collection workflow runs ansible-lint 26.10.1 with `--strict`,
+  so an ansible-lint warning now fails CI as well as an error. A rule the
+  code can't meet goes in `skip_list` in `ansible/.ansible-lint`, with the
+  reason.
+* The ShellCheck workflow and the service test's ShellCheck step no longer
+  exclude any checks, so findings such as an unquoted variable expansion
+  (SC2086), an unused variable (SC2034), or a `cd` without `|| exit` (SC2164)
+  now fail CI. Suppress one only on the command it's about, with a comment
+  saying why.
+* The ShellCheck workflow also runs actionlint 1.7.12 over the workflows,
+  which checks the shell in their `run:` blocks with ShellCheck 0.11.0 and
+  every default check on. The self-hosted runner labels it needs are in the new
+  `.github/actionlint.yaml`.
+* The new `tools/check-embedded-shell.py`, run by the ShellCheck workflow,
+  checks the shell that lives inside other files with ShellCheck: the
+  Ansible collection's `shell:` and `raw:` tasks, the composite actions'
+  `run:` steps, the scripts that heredocs feed to a shell (such as the ones
+  the system tests run in their guests), and the workflow `run:` blocks
+  that GitHub runs under `sh`. It needs PyYAML.
+* **Breaking:** the server's vfio-user socket is now mode `0600`, so only
+  the server's user and root can connect, rather than `0666`, and
+  `rocm-ernic-launcher` and `ernicctl hot-reload` no longer make the instance
+  sockets `0666`. Whoever connects to the socket drives the emulated device
+  as the guest's QEMU, so any local user could take over an instance, or
+  keep the real VM from attaching. The server creates the socket with these
+  permissions whatever its umask, rather than changing them after it's
+  already listening. QEMU running as the server's user or as root, as with
+  `sudo ernicctl vm-launch`, is unaffected. To let a QEMU running as another
+  user connect, use the new `--socket-group` (`ERNIC_SOCKET_GROUP` for the
+  service). The server also refuses to start if the socket ends up with
+  other permissions or an ACL, which a default ACL on its directory can
+  cause, since an ACL entry naming another user lets that user connect
+  without the mode showing it; remove the default ACL (`setfacl -k`) or use
+  another directory.
+* A TCP mesh worker now ignores a topology update that doesn't come on its
+  own connection to the manager, as it already ignored the GID table. An
+  update decides which other workers a worker connects to, and now also which
+  of its connections to them it closes, so another worker could otherwise
+  have it drop its links.
+* The hosted CI starts its guests with `-machine hpet=off`, to avoid an
+  occasional hang of the nested guest kernel in early boot, before the ionic
+  driver loads. When a guest never answers SSH,
+  `scripts/qemu-vm-diagnose.sh` now also samples where each vCPU is,
+  reports a QMP command that never returns, and reports a kernel that
+  stopped before switching to its final clocksource, with what else to rule
+  out before putting it down to that hang.
+* At startup, the server removes what's at its `--socket` path only if it's
+  a socket, as one left by a server that didn't exit cleanly is. It refuses
+  to start, saying why, if anything else is there, a symlink included. It
+  used to remove a symlink to a socket, and fail with only
+  `vfu_create_ctx() failed` for anything else. It now checks and removes the
+  entry relative to its directory, opened once, so changing a directory in
+  the path in between can't make a server running as root remove a file
+  elsewhere. It also no longer waits 100 ms before creating the socket.
+* **Breaking:** The server reads the numbers in its options strictly, and
+  refuses to start, saying which option is wrong, if one is malformed:
+  * The numbers in `--backend nvmeof:...` and `--backend s3:...` options are
+    decimal only. A `0x` prefix used to be read as hexadecimal and a leading
+    0 as octal, so `port=010` was port 8; it's now port 10, and `port=0x1145`
+    is refused. Addresses (`ip=`) are dotted decimal, with no leading zeros,
+    signs, or spaces.
+  * `--mac` takes exactly six pairs of hex digits separated by colons, such
+    as `02:00:00:00:00:01`, as its usage says. It used to accept single
+    digits, and ignore anything after the sixth byte.
+  * The verbs backend's `port=` is refused if it has anything but digits;
+    `port=1x`, `port=+1`, and `port= 1` used to be port 1.
+  * The `tcp` backend's ports (`tcp:manager:listen:PORT`,
+    `tcp:manager:HOST:PORT`, and `tcp:worker:HOST:PORT`) are refused if
+    they have anything but digits, and a value with a leading space or `+`
+    in `ERNIC_TCP_LISTEN_BACKLOG`, `ERNIC_TCP_HEALTH_INTERVAL`, or
+    `ERNIC_TCP_SOCKBUF` is ignored, as other malformed values already were.
+* The `s3` backend's `size=` accepts a `T` multiplier, as
+  `docs/s3.rst` says and the `nvmeof` backend's does.
 
 ### Removed
 
@@ -99,9 +306,113 @@
   emulated device is now always ionic and there is no flag to select it.
 * The milestone benchmark tables in `docs/performance.rst`. They measured the
   removed device; the live ionic numbers are in `docs/perf-trends.rst`.
+* The PVRDMA device's data path in the `tcp` and `loopback` backends, which
+  nothing has used since that device was removed: the ionic data path moves
+  the data itself. A TCP mesh node now ignores the data-path messages that
+  path sent (sends, receives, completions, and RDMA writes and reads) rather
+  than acting on them. Data that came for a queue pair with no receive posted
+  used to be kept until the guest destroyed the queue pair, so any mesh peer
+  could grow a node's memory without bound. The `loopback` backend's `mode=`
+  and `md5` options went with it; `--backend loopback:...` still accepts them
+  and ignores them. The unit tests of that code, `tcp-mr-bounds-unit` and
+  `loopback-sge-copy-unit`, are gone too. So are the bugs found in it, which
+  a guest or mesh peer could reach and which had been fixed in place: memory
+  region bounds checks and scatter-gather length sums that could wrap, a
+  region with no host mapping used as if it had one, a work request partly
+  mapped or with more entries than it holds, DMA mappings leaked on local
+  sends, and a rejected local RDMA write reported to the guest as a success.
+* The `/run-ci` pull request comment command and its `ci-command.yml`
+  workflow, which ran on every issue and pull request comment. Start the
+  self-hosted CI from the Actions tab's *Run workflow* button, or with
+  `gh workflow run self-hosted-ci.yml -f pr=N`; `ci/README.md` describes the
+  inputs.
+* The PVRDMA DMA-mapping layer in `rocm_ernic_compat.c`, which nothing
+  called, and the QEMU compatibility stubs and headers that only removed
+  PVRDMA code used. With it went the `ERNIC_DEBUG_DMA_MAP` environment
+  variable, and the `ernic_debug_dma_map` Ansible setting that wrote it. Only
+  that layer read it, so it already had no effect.
 
 ### Fixed
 
+* A send work request with more than 14 SGEs, which the 512-byte WQE
+  stride the device advertises has room for, is now read whole. The device
+  read the first 256 bytes of the WQE and then walked its SGE list as far as
+  the stride reached, past the end of the buffer it had read into, so it
+  gathered from addresses it took from its own stack. A receive WQE that
+  size had the SGEs after its 14th ignored.
+* The emulated device now refuses a queue whose geometry it can't honor,
+  failing the command that creates it: an event, completion or admin queue,
+  or a queue pair's send or receive queue, deeper than 2^24 entries; a send
+  or receive queue with a stride outside 2^5 to 2^9 bytes, the largest being
+  what the device advertises; and a completion or event queue with a stride
+  too small for one entry or above 2^16 bytes. The guest gives these as
+  exponents, which the device shifted by unchecked, and a shift by 32 or
+  more is undefined behaviour. A completion queue the data path refused
+  was also reported to the guest as created. The Linux driver asks for
+  nothing outside these bounds.
+* A TCP mesh node that was restarted used to be unreachable for the rest of
+  the mesh's life. The manager allocates node ids monotonically and never
+  evicts a dead node, so the restarted process registered under a new id
+  while the dead one kept its claim on the guest's GID; both ids then
+  claimed the same address and the duplicate-claim rule resolved it to
+  neither, so peers failed `MODIFY_QP` for that destination with "claimed by
+  more than one node". A node the manager has declared dead now keeps its
+  claims but stops owning them, so it neither answers for its addresses nor
+  contests them, and the same guest returning under a new id owns them. A
+  node that is merely late gets its claims back when it answers again,
+  without having to advertise them, and two *live* claimants still contest
+  as before. Restarting one node of a mesh no longer means restarting all of
+  them.
+* The emulated device now refuses a work request whose address and length
+  wrap around the end of the address space before it asks libvfio-user to
+  translate them. libvfio-user's fast path adds the two and compares the
+  sum against the end of the mapped region, so a large enough length wrapped
+  that addition into a small number, which a legitimately mapped region
+  passed; the translation that came back then described the full length.
+  Unsigned wrap-around is defined behaviour, so no sanitizer reported it.
+* An RDMA read or write whose length runs past the end of the region its
+  key names is now refused before anything is transferred. The transfer
+  walked until it ran out of region and only then reported the overrun, so
+  a rejected write had already left its first bytes in the tail of the
+  target region and a rejected read had already copied them out. Both
+  stayed inside the registered region, so neither reached memory the key
+  did not cover. Zero-length operations are still exempt, as the key in one
+  is not required to be valid.
+* A work request naming memory the guest has not registered now fails on
+  the queue pair that posted it, with a local protection error, as InfiniBand
+  requires. A SEND whose gather failed used to complete successfully for the
+  sender and put the error on the peer's receive completion, so the guest
+  was told the wrong thing and the wrong queue pair was blamed; one crossing
+  the mesh sent the peer a request it could not satisfy. No data was
+  transferred in either case, and none is now.
+
+* A server that shut down cleanly removed its socket's path a second time
+  after closing the socket, so it could remove the socket of another server
+  started at the same path in between.
+* The server sized its resource tables from the backend's device limits
+  without checking them. A negative limit, or a `max_qp * max_qp_wr` too
+  large for the completion context table, gave a table of the wrong size,
+  and a table that couldn't be allocated aborted the server. The server now
+  refuses to start with an error naming the limits, and reports a failed
+  allocation instead of aborting.
+* A server that failed to start after creating its vfio-user socket, such as
+  one given a `--tap` it couldn't attach, exited with the TCP backend's
+  threads still running and left the socket behind. It now tears the device
+  down first, which stops and joins those threads and removes the socket, as
+  a clean shutdown does.
+* The test scripts, the self-hosted CI scripts in `ci/`, and the developer
+  scripts in `scripts/` find bash through `PATH` (`#!/usr/bin/env bash`)
+  instead of requiring `/bin/bash`, so `ctest` and the scripts run on systems
+  without it, such as NixOS. The installed service and driver-pack scripts
+  still use `/bin/bash`.
+* Shutting down a `loopback`, `nvmeof` or `s3` server that a guest had
+  connected to locked a mutex and wrote past the end of the backend's state
+  on the heap: the data path cleared its mesh receive callback through the
+  TCP backend whatever the backend was. The TCP backend's ionic entry points
+  now do nothing on another backend. Found by `ionic-harness-*`.
+* Shutdown leaked the queues and mutex of every CQ and QP the loopback
+  backend held, and the deferred-completion queue set up when the device was
+  realized.
 * The driver pack recorded a hardcoded `v7.2.4` as the ionic baseline
   regardless of `IONIC_KERNEL_REF`, so bumping the cmake pin left guests
   fetching the old sources while the patches shipped beside them came from the
@@ -118,6 +429,9 @@
   field exactly, so their lines came out as `NAME: 4` and were dropped by the
   parser. The exporter also no longer attributes a device-level key that
   appears after the per-QP block to the last QP it saw.
+* The `--stats-file` file is created with mode `0644`, less the umask, like the
+  `--log-file` file. It was created with `0666`, so under a permissive umask
+  any local user could rewrite the counters `ernic-exporter` reports.
 
 * MSI-X assertions raised while a vector is masked are latched and replayed
   when the driver unmasks, instead of being dropped. Every vector comes out of
@@ -129,76 +443,6 @@
   credit return. `tests/test_ionic_intr_pending.c` (CTest
   `ionic-intr-pending-unit`) covers both paths, mask-on-assert re-latching, and
   the collapse of repeated assertions into one delivery.
-* A local loopback RDMA write whose bounds check fails is now reported to the
-  guest as a failure. The check in `tcp_post_send()` correctly refused the
-  copy, but execution then fell through to an unconditional statistics update
-  and an `IBV_WC_SUCCESS` completion, so the guest was told a write that had
-  copied nothing had succeeded and went on reading whatever the target region
-  held before. The same fault on the remote path has always failed the work
-  request; the loopback shortcut now reaches the same verdict without the
-  wire, completing with `IBV_WC_REM_ACCESS_ERR` and zero bytes, and the byte
-  counters are updated only after a copy that actually happened. Reachable
-  from the guest by posting a write to a loopback queue pair with a bad key,
-  a region with no host mapping, or an out-of-range address.
-* `tcp_wr_map_sge()` now refuses a work request whole when any of its
-  scatter-gather entries cannot be mapped, instead of zeroing that entry's
-  length and continuing. Every copy loop downstream walks the entries in order
-  and advances its destination cursor only for entries it actually copies, so
-  a skipped entry did not leave a hole -- it slid all the later data down by
-  that entry's length, writing the right number of bytes to the wrong offsets
-  and completing successfully. Both callers now fail the request with
-  `IBV_WC_LOC_PROT_ERR`.
-* `tcp_wr_map_sge()` now bounds `num_sge` against the 32-entry array it fills.
-  The count was stored in `wr->num_sge` and travels to the peer inside the
-  work request, where receive-side loops iterate to it without re-clamping;
-  this was previously safe only because the PVRDMA command layer rejected
-  larger values first.
-* The local loopback path in `tcp_post_send()` now releases the DMA mappings
-  taken by `tcp_wr_map_sge()` before freeing the work request, and pops the
-  send queue under `priv->lock`. The mappings were leaked on every loopback
-  send, and the pop without the lock raced the two receive-thread sites that
-  pop the same queue.
-* Memory region bounds checks in the TCP and loopback backends no longer
-  overflow. The checks were written as `addr + len > start + length`, whose
-  unchecked 64-bit arithmetic a peer could wrap by choosing an `addr` just
-  below the region modulo 2^64: the comparison then succeeded and the host
-  pointer computed from it landed an attacker-chosen distance outside the
-  registered region, giving an out-of-bounds read or write. Both backends now
-  test containment by subtraction, so every intermediate stays inside a range
-  already proven not to wrap. This covers the five memory-region bounds checks:
-  the TCP `RDMA_WRITE` and `RDMA_READ_REQ` handlers, `tcp_wr_map_sge()`, the
-  local loopback path in `tcp_post_send()`, and `loopback_translate_addr()`.
-  It does not cover every unchecked sum in the data path -- see "Known issues"
-  below. Both backends take both of their bounds from the same guest-supplied
-  registration -- `cmd->start` becomes `mr->start` in `rdma_rm_alloc_mr()` and
-  `lmr->guest_start` in the loopback `create_mr()` -- so `start + length` was a
-  live wrap point on both sides, not just one.
-* The local loopback path in `tcp_post_send()` now accumulates scatter-gather
-  lengths in 64 bits. A sufficiently long SGE list could wrap the previous
-  32-bit sum, which then passed the bounds check while the per-entry copies
-  still wrote their full unwrapped lengths.
-* The TCP backend no longer forms host pointers from memory regions that have
-  no host mapping. `rdma_rm_alloc_mr()` records `virt = NULL` when the mapping
-  fails and `create_mr()` continues anyway, so the region kept the guest's own
-  `start` and `length`. The bounds check always passed by construction and
-  the offset was then added to `NULL`, turning an out-of-region write into an
-  absolute write at a guest-chosen address. The region's backing is now part
-  of the bounds check, alongside its extent.
-* The remote send path in `tcp_post_send()` now sums scatter-gather lengths in
-  64 bits and bounds the result before it reaches the wire. The previous
-  32-bit sum sized two heap buffers whose fill loops wrote the full unwrapped
-  per-entry lengths, so a wrapped total undersized the allocation rather than
-  merely reporting it incorrectly. The receive path enforces its ceiling per message
-  rather than per send, so the bound is applied per branch, against whatever
-  that branch actually frames as one message: an RDMA write sends the whole
-  sum behind a header, so its total is capped one header below the ceiling; a
-  read request is header-only and its total describes the peer's response, so
-  it is capped at the ceiling itself; a large send emits one message per
-  scatter-gather entry, so each entry is capped and the total is left alone.
-  A single bound on the total would have rejected large multi-entry sends that
-  the wire format handles without difficulty. A static assertion ties the
-  coalesced branch's threshold and header to the ceiling so that relationship
-  cannot drift.
 * `pvrdma_map_to_pdir()` no longer truncates its page-count check. `nchunks *
   PAGE_SIZE` was computed in 32-bit while the length it is compared against is
   64-bit, so a guest could wrap the product to match a short length and then
@@ -216,24 +460,255 @@
   16 * 2^40 bytes and drive a walk of four billion iterations. Widening the product
   above narrowed the mismatch case but left the count unbounded, so this
   completes that fix rather than replacing it.
+* A server on the TCP backend no longer hangs on SIGTERM. Its accept thread
+  stayed blocked in `accept()` until a peer happened to connect, and a
+  manager's health-check thread slept out the whole
+  `ERNIC_TCP_HEALTH_INTERVAL` before it noticed the shutdown; shutdown now
+  wakes both. A worker that fails to register with its manager also stops its
+  accept thread before freeing the state that thread uses, and its 5-second
+  registration timeout is now measured on the monotonic clock, so a change to
+  the system time no longer shortens or stretches it.
+  `tests/test_tcp_thread_stop.c` (CTest `tcp-thread-stop-unit`) covers both
+  threads, and `server-lifecycle` checks that a manager exits promptly.
+  `tcp-mesh-ci` no longer SIGKILLs its nodes: a node still running 30 seconds
+  after SIGTERM, or one that exits with a non-zero status, fails the test.
+* A TCP mesh node no longer frees its backend at shutdown while receive
+  threads are still using it. A manager freed its table of mesh nodes while
+  those threads could still read it, which ThreadSanitizer reported, and never
+  stopped or freed the connection of a peer that connected but didn't
+  register, such as one it refused for running an older protocol version,
+  which LeakSanitizer reported. The backend now stops every one of its threads
+  before it frees any of its state. A thread waiting for the rest of a message
+  now also gives up when it is stopped, so a peer that sends a message header
+  and withholds the payload can no longer hold up shutdown, whether it does so
+  to a receive thread or to a worker's accept thread during the handshake. Nor
+  can a peer that stops reading. A thread sending to it -- a receive thread
+  replying, a broadcast to every node, the health check's heartbeat -- waits
+  for room in the socket while holding locks that shutdown needs, and other
+  threads can wait on those locks in turn. Once shutdown begins, such a send
+  now gives up instead of waiting, and stopping a receive thread also shuts its
+  socket down. Sends now use `MSG_NOSIGNAL`, so a failed send to a peer that
+  has gone returns an error instead of raising a SIGPIPE that could kill the
+  server. `tcp-thread-stop-unit` covers all three, and runs a manager's whole
+  shutdown with a worker that has stopped reading.
+* A TCP mesh node that can't start one of its threads, because the process is
+  out of threads or memory, no longer tries to join that thread at shutdown,
+  which could crash the server. A connection whose receive thread can't be
+  started is closed instead of kept, and a node whose accept or health-check
+  thread can't be started fails to initialize. `tcp-thread-stop-unit` covers
+  it.
+* A TCP mesh manager whose reconnect to an unresponsive node fails no longer
+  stops that node's old connection a second time on the next attempt. It
+  joined the old receive thread again, which is undefined behavior and could
+  crash the manager or hang its health check. The old connection's socket is
+  also now shut down before its thread is joined, so a send the thread is
+  blocked in can't stall the reconnect, and closed under the connection's
+  lock, so a thread sending on that connection can't send on the descriptor
+  after it has been reused for another connection. `tcp-thread-stop-unit`
+  covers the failed reconnect.
+* A TCP mesh worker no longer crashes on a malformed handshake from a host
+  that connects to its listen port. A handshake with no payload crashed it
+  with a NULL pointer dereference, and one too short to hold a node id and
+  protocol version was read past its end; both are now refused. So is a
+  message of another type followed by a second connection that hangs up or
+  sends nothing, which freed the first message's payload a second time. A
+  worker also no longer takes up to 5 seconds to shut down while a peer that
+  has connected sends nothing. `tcp-thread-stop-unit` covers each case.
+* A TCP mesh manager no longer registers a connection a second time when a
+  peer sends a second registration on it. The connection was given a second
+  node id and kept under both, so shutdown freed it twice, and a reconnect
+  that replaced one of the two could free it while the other was still in
+  use. Any host that could reach the manager's port could crash it this way.
+  A registration on a connection that has already registered is now ignored.
+  `tcp-thread-stop-unit` covers it.
+* A TCP mesh manager no longer deadlocks when a node it has declared dead
+  sends a heartbeat while the manager reconnects to it. The health check held
+  the mesh table's lock throughout, and the reconnect waits for the old
+  connection's receive thread, which needed that lock to record the
+  heartbeat; the manager then stopped registering nodes, and hung on SIGTERM.
+  The health check now holds the lock only to decide what to do, so
+  registrations and heartbeats no longer wait for a reconnect, or for a
+  heartbeat sent to a node that has stopped reading, and a node registering
+  while the health check reports a dead node can no longer cut its pass
+  short. A node that answers while the manager is reconnecting to it keeps
+  its connection. The reconnects in each health-check pass now give up on
+  nodes that don't answer after one health-check interval
+  (`ERNIC_TCP_HEALTH_INTERVAL`, 5 seconds by default) between them, rather
+  than when the kernel gives up on each, about two minutes later. No
+  heartbeats go out while they wait, so several unreachable nodes could
+  otherwise get the nodes that were still answering, or had just
+  registered, declared dead. Nodes that a pass runs out of time for go first
+  in the next one, in the order they were put off, so nodes that never answer
+  can't keep the others from being reconnected. SIGTERM no longer waits for a reconnect either.
+  `tcp-thread-stop-unit` covers each case.
+* A TCP mesh worker's RDMA traffic no longer stalls while it connects to the
+  peers the manager tells it about. It held the connection table's lock,
+  which the data path takes to find a peer's connection, across each
+  connect, so a peer that didn't answer stalled the worker until the kernel
+  gave up on the connect, about two minutes later, and SIGTERM waited as
+  long. The connects also ran on the thread that answers the manager's
+  heartbeats, so the manager could declare the worker dead meanwhile. A
+  worker now connects to its peers on a thread of its own, without the lock,
+  and SIGTERM no longer waits for a connect. Each connect gives up after one
+  health-check interval (`ERNIC_TCP_HEALTH_INTERVAL`, 5 seconds by default),
+  and every peer is tried in turn, so one that doesn't answer can't keep the
+  worker from connecting to the others. A peer the worker couldn't connect
+  to was left unconnected until the mesh changed; it is now tried again
+  every interval or so. A worker also no longer tries to connect to peers
+  the manager reports dead, including one reported dead while the worker is
+  connecting to it or to another peer. `tcp-thread-stop-unit` covers each
+  case.
+* A TCP mesh node no longer drops a connection when a message header arrives
+  in parts. A header that had partly arrived was given up on and the part
+  read was lost, so the next read started in the middle of the header, failed
+  the protocol magic check, and closed the connection. A header can straddle
+  a TCP segment boundary anywhere in a busy connection, so this could happen
+  under load on a real network. A node now waits for the rest of the header,
+  as it already did for the rest of a payload. A worker's listen port gives a
+  connecting peer 5 seconds to send all of its handshake, including the rest
+  of one it has started, so a peer that sends part of one and stops holds up
+  the peers behind it no longer than one that sends nothing.
+  `tcp-thread-stop-unit` covers messages split at several points.
+* A TCP mesh manager now closes the connections it is done with. A peer that
+  connected and hung up without registering -- a port scan, a load
+  balancer's health check, a node refused for running an older protocol
+  version -- left its socket open in `CLOSE_WAIT`, and a thread behind it,
+  until the manager shut down, and a peer that connected and sent nothing
+  kept them indefinitely. A registered node that went away left its socket
+  open until the manager reconnected to it, which might be never. Enough of
+  these ran the manager out of file descriptors. The manager now closes a
+  connection whose peer has hung up or been refused when the next peer
+  connects, or within a health-check interval (`ERNIC_TCP_HEALTH_INTERVAL`,
+  5 seconds by default), and closes one that hasn't registered within 5
+  seconds of connecting. At most 64 connections wait to register at once;
+  any more are closed as they arrive. A peer that sends anything but a
+  registration before it has registered is now disconnected: the manager
+  used to act on such messages, including relaying traffic to other nodes,
+  and a relay to a node that had stopped reading could then hold up
+  closing the connection. A registered node that hangs up is
+  reported dead to the rest of the mesh within a health-check interval,
+  rather than after three. A node that runs out of file descriptors also no
+  longer retries accepting a connection in a tight loop that logged an error
+  each time, which could fill the disk; it now waits 100 ms between
+  attempts. `tcp-thread-stop-unit` covers each case.
+* A TCP mesh node no longer trusts the sender a message names in its header,
+  which the sender writes. A manager credited a heartbeat to the node the
+  heartbeat named, so any registered node could keep another, dead, node
+  alive, or bring it back; it now credits the node whose connection the
+  heartbeat came on. Every node sent its answer to an RDMA write or read, or
+  to a send, to the node the request named, so a peer could have the
+  completion, or the memory it asked to read, delivered to another node; the
+  answer now goes back on the connection the request came on.
+  `tcp-thread-stop-unit` covers each case.
+* A TCP mesh node that the manager has declared dead and that answers a
+  heartbeat again is now reported alive to the rest of the mesh at once. The
+  other nodes used to keep treating it as dead, and not connect to it, until
+  a node joined, died, or was reconnected. Topology updates sent at about the
+  same time can also no longer reach the nodes out of order, which could
+  leave them with an older picture of the mesh than the manager's.
+  `tcp-thread-stop-unit` covers the revival.
+* A TCP mesh manager that reconnects to a node that has stopped answering no
+  longer frees the node's old connection while another thread is still
+  using it, sending on it or relaying through it. Connections are now
+  reference counted, and the last thread to finish with one frees it. The
+  connection of a node that hangs up, or that the manager reconnects to, is
+  also taken out of the manager's connection table, instead of staying there
+  closed until shutdown.
+* Data that reaches a TCP mesh node before the guest has posted a receive for
+  it is now completed on the connection it came on, once the receive is
+  posted. The completion used to go to whichever connection the node named
+  as the data's sender had by then, so a peer could have it delivered to
+  another node. If that connection has closed meanwhile, no completion is
+  sent. `tcp-thread-stop-unit` covers both fixes.
+* A TCP mesh worker now takes its node id only from the manager, and only
+  once. It used to accept the answer to its registration from any
+  connection, at any time, so another worker could change its node id, and
+  the GIDs it claims, by sending it one. A worker also no longer accepts
+  connections from its peers, or connects to them, before it has its id. It
+  used to introduce itself as node 0, the manager's id, to a peer that
+  connected while it was registering, and to its peers when a topology update
+  arrived before the manager's answer. A manager that refuses the
+  registration, or assigns 0 or `UINT32_MAX`, now makes the worker fail at
+  once rather than after the 5-second registration timeout.
+  `tcp-thread-stop-unit` covers each case.
+* A TCP mesh worker now reconnects to another worker when the connection
+  between them drops, or when the manager reports the other worker dead and
+  then alive again. It used to keep the dead connection, with its socket
+  open in `CLOSE_WAIT`, until it shut down, and the two workers never
+  connected again, because each refused or skipped a new connection as a
+  duplicate of the dead one. Traffic between them was sent into the dead
+  connection meanwhile, and failed; it now goes through the manager until
+  they reconnect. A worker now closes a dead connection within a
+  health-check interval (`ERNIC_TCP_HEALTH_INTERVAL`, 5 seconds by default),
+  and connects again if it has the lower id; one with the higher id replaces
+  the dead connection when the other connects again. A worker also closes its
+  connection to a worker the manager reports dead, so the connection to one
+  that went away without closing it, in a crash or a network partition, no
+  longer looks connected until a send fails. A second connection claiming to
+  be a worker that is still connected is still refused.
+  `tcp-thread-stop-unit` covers each case.
+* The server no longer exits when a client disconnects or sends something
+  other than a version message during vfio-user negotiation. A port probe or a
+  client that crashed while connecting used to take the server down; it now
+  logs `client dropped during negotiation` and waits for the next client.
+  Other attach errors are still fatal.
+* The server frees the emulated ionic device at shutdown, and no longer leaks
+  the parsed path of an `nvmeof` backend's `file=` namespace. LeakSanitizer
+  and valgrind reported both. `tests/test_server_lifecycle.c` (CTest
+  `server-lifecycle`) starts the real server and checks that misbehaving
+  clients and SIGTERM/SIGINT end in a clean shutdown with no sanitizer report.
+* The Nix `analysis-sanitizers`, `analysis-tsan`, and `analysis-valgrind`
+  targets no longer report a clean run when the server never got through
+  the exercise, so its leak checks never ran. The first line of
+  `summary.txt` is now `exercise: clean` or
+  `exercise: incomplete (<reason>)`, and an incomplete exercise fails the
+  build: a server that never started listening, a client that failed or
+  timed out, a server that never handled the client's connection, or one
+  that didn't shut down cleanly. Sanitizer and valgrind
+  findings still don't fail it, including a sanitizer finding that stopped
+  the server before the exercise finished.
+* The `malloc-no-null-check` and `goto-usage` rules of the Nix
+  `analysis-semgrep` target never parsed, so semgrep skipped them on every
+  run. Both run now, so every `goto` is reported, at `INFO`.
+  `malloc-no-null-check` follows the pointer's data flow, so a NULL check
+  covers only the allocation it tests, and recognizes checks that return,
+  `goto`, `exit()` or `abort()`.
+  `analysis-semgrep` tests its rules against the fixtures in
+  `nix/analysis/semgrep-tests/` and fails if one doesn't pass, if a rule
+  doesn't parse, or if the scan fails, and reports source that semgrep
+  could only partly parse. The Nix Check workflow builds the new
+  `analysis-runners` check, which tests these targets' scripts against a
+  fake server, client and scan.
+* `ernic-device-tuple-unit` no longer fails when the build directory's path
+  is long. The emulated-device lookup in `tests/ernic_device.h` built each
+  sysfs attribute path in a 192-byte buffer and treated a longer one as no
+  match; it now allows `PATH_MAX`.
+* The `s3` backend read a `Content-Length` of `-1`, or one too large for 64
+  bits, on a request with an `x-amz-rdma-token` as the largest possible
+  length, rather than refusing the request. It now answers a
+  `Content-Length` that isn't just digits with `400`. A `Range` header with
+  a sign in it, such as `bytes=--64`, which was read as a huge suffix and
+  returned the whole object, is now answered with `416`, as other malformed
+  ranges are. `partNumber` is read as decimal; `0x10` used to be part 16.
 
 ### Limitations
 
 ### Known issues
 
-* Several unchecked 32-bit sums of the same class as the bounds-check fixes
-  above remain in the TCP backend and are not addressed here. The receive and
-  read-completion paths clamp a per-SGE copy with
-  `if (bytes_copied + to_copy > data_len)`, whose `uint32_t` addition a
-  guest-supplied SGE length can wrap so that the clamp is skipped and the copy
-  runs well past the payload. The DMA memory-region path in `tcp_wr_map_sge()`
-  compounds this: `pci_dma_map()` may map less than was asked for, but its
-  in/out length is ignored and the work request keeps the full requested
-  length.
-* `create_mr()` still registers a memory region whose host mapping failed,
-  with `virt = NULL` and the guest's own `start` and `length`, so that the
-  loopback backend can allocate its keys from the metadata alone. Both
-  backends now reject such a region at the point of use -- the TCP one in
-  `tcp_mr_range_ok()`, the loopback one by skipping regions without a mapping during
-  translation -- but the registration itself is unchanged, and neither
-  `cmd->start` nor `cmd->length` is validated before it.
+* While the TCP backend is running, a mesh node that stops reading can stall
+  the node sending to it. A send waits for room in the socket for as long as
+  it takes, and a broadcast to every node does that while holding the
+  connection table's lock, which the data path needs too. Only shutdown makes
+  such a send give up.
+* The TCP backend still looks up mesh nodes' hostnames with a lookup that
+  can't be interrupted or given a deadline. A worker advertises its
+  `gethostname()`, which its peers and the manager's health check look up
+  before each connect, so a slow DNS server can make SIGTERM wait for the
+  resolver to give up, which its configured timeouts and retries bound. A
+  hostname that resolves from `/etc/hosts`, or a numeric address, doesn't
+  wait.
+* A TCP mesh worker whose connection to the manager drops doesn't connect to
+  it again. The manager connects to the worker instead, but the worker takes
+  topology updates and GID tables only on the connection it opened itself, so
+  it ignores the manager's from then on, and doesn't learn of workers that
+  join, die, or come back, or of their GIDs, until it restarts.

@@ -8,6 +8,7 @@
 #ifndef IONIC_DATAPATH_H
 #define IONIC_DATAPATH_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <vfio-user/libvfio-user.h>
@@ -25,9 +26,9 @@ struct ionic_datapath;
  * reachable before the first capsule moves.
  *
  * IONIC_MAX_MR sizes three tables that all have to hold that many: the
- * rdma_rm resource table (MAX_MR in third-party/qemu/hw/rdma/rdma_rm_defs.h,
- * which cannot include this header), the data path's own dp_mr array, and the
- * admin queue's driver-id-to-handle map.  Whichever is smallest is the real
+ * rdma_rm resource table (MAX_MR in src/qemu/rdma_rm_defs.h, which cannot
+ * include this header), the data path's own dp_mr array, and the admin
+ * queue's driver-id-to-handle map.  Whichever is smallest is the real
  * ceiling, so they are kept equal deliberately.
  *
  * It is not sized for the maximum 64 queues: dp_reg_mr() walks the whole
@@ -59,6 +60,55 @@ struct ionic_dp_ring_desc {
     uint8_t stride_log2;
 };
 
+/*
+ * Bounds on the ring geometry a guest may ask for.
+ *
+ * The driver sends each ring's depth and stride as log2 exponents, and the
+ * device works with 1u << depth_log2 and 1u << stride_log2. Shifting a
+ * 32-bit value by 32 or more is undefined, so every exponent from the guest
+ * is checked against these before anything shifts by it, and a command
+ * asking for more is refused rather than clamped: a ring of a size the
+ * driver didn't ask for is one neither side agrees about. SRQs have tighter
+ * bounds of their own (IONIC_SRQ_* in rocm_ernic_compat.h).
+ *
+ * DEPTH: 2^24 entries. The Linux driver's admin and event queues are 2^6
+ * and 2^9 (IONIC_AQ_DEPTH and IONIC_EQ_DEPTH, rounded up to a power of
+ * two), and the data path has always refused a deeper CQ.
+ *
+ * STRIDE: 2^16 bytes for the rings of fixed-size entries, the largest CQ
+ * stride the data path has accepted. A send or receive queue's stride is
+ * held to the max_stride the device advertises in its LIF identity
+ * (IONIC_MAX_STRIDE in ionic_eth_emu_priv.h), 2^9, and the data path reads
+ * a whole WQE of that size, so it never sees part of one.
+ *
+ * The floors are the size of what each ring holds, since entries any
+ * smaller would overlap: a CQE is 32 bytes, and so is the part of a send or
+ * receive WQE ahead of its payload (WQE_PLD_OFF in ionic_datapath.c), which
+ * the data path reads from every WQE.
+ */
+#define IONIC_RING_MAX_DEPTH_LOG2  24u
+#define IONIC_RING_MAX_STRIDE_LOG2 16u
+#define IONIC_CQ_MIN_STRIDE_LOG2   5u
+#define IONIC_WQE_MIN_STRIDE_LOG2  5u
+#define IONIC_WQE_MAX_STRIDE_LOG2  9u
+
+/* True if a ring's exponents are within the bounds above. */
+static inline bool ionic_dp_ring_geometry_ok(uint8_t depth_log2,
+                                             uint8_t stride_log2,
+                                             uint8_t min_stride_log2,
+                                             uint8_t max_stride_log2)
+{
+    return depth_log2 <= IONIC_RING_MAX_DEPTH_LOG2 &&
+           stride_log2 >= min_stride_log2 && stride_log2 <= max_stride_log2;
+}
+
+/* A CQ's stride; the driver may leave it 0 for the size of one CQE. */
+static inline uint8_t ionic_dp_cq_stride_log2(
+    const struct ionic_dp_ring_desc *ring)
+{
+    return ring->stride_log2 ? ring->stride_log2 : IONIC_CQ_MIN_STRIDE_LOG2;
+}
+
 /* Raised once completions have been written to a CQ. */
 typedef void (*ionic_dp_cq_event_fn_t)(void *opaque, uint32_t eq_id,
                                        uint32_t cq_id);
@@ -85,11 +135,66 @@ void ionic_datapath_register_qp(struct ionic_datapath *dp, uint32_t qp_id,
 void ionic_datapath_unregister_qp(struct ionic_datapath *dp, uint32_t qp_id);
 
 /*
+ * Shared receive queues.
+ *
+ * An SRQ is a receive ring like a QP's own, with two differences that matter
+ * here: it is named by its own qid in its own qtype space, and several QPs
+ * draw from it at once. The second is why it carries a lock where a per-QP
+ * RQ does not -- a local send and a message off the mesh can be delivered to
+ * two different QPs on two threads, and without the lock both would take the
+ * same slot.
+ *
+ * A QP bound to an SRQ has no RQ ring of its own: CREATE_QP leaves the rq_*
+ * fields zero and puts the SRQ's qid in rq_tbl_index_srq_id (~0 means "no
+ * SRQ"). Its receive completions still go to its own rq_cq_id.
+ */
+/*
+ * Returns 0, or negative on failure: -EINVAL for an unknown id or a ring
+ * geometry outside IONIC_SRQ_MAX_{DEPTH,STRIDE}_LOG2, -EIO when the guest
+ * page table cannot be read. The caller must fail CREATE_SRQ on a negative
+ * return. Reporting success for an SRQ with no receive ring is the one
+ * outcome worth avoiding: the guest then owns a queue that accepts posts and
+ * never completes them, which surfaces as a hang in the datapath rather than
+ * an error from the verb that caused it.
+ */
+int ionic_datapath_register_srq(struct ionic_datapath *dp, uint32_t srq_id,
+                                const struct ionic_dp_ring_desc *rq);
+void ionic_datapath_unregister_srq(struct ionic_datapath *dp, uint32_t srq_id);
+void ionic_datapath_bind_qp_srq(struct ionic_datapath *dp, uint32_t qp_id,
+                                uint32_t srq_id);
+
+/*
+ * Address handles.
+ *
+ * A connected QP learns its peer once, at MODIFY_QP's RTR transition. An
+ * unreliable datagram QP does not have one peer: every send names its
+ * destination itself, by an AH id and a destination QPN in the WQE, and the
+ * AH is where the RoCE header template -- and so the destination GID that
+ * says which node the peer is on -- actually lives.
+ *
+ * Without this table a UD send had nowhere to resolve its ah_id, so the
+ * datapath fell back to q->dest_qp_id, which a UD QP never sets, and
+ * delivered every datagram back to the sender's own QP.
+ */
+void ionic_datapath_register_ah(struct ionic_datapath *dp, uint32_t ah_id,
+                                const uint8_t dgid[16], const uint8_t sgid[16],
+                                const uint8_t dmac[6], uint32_t dest_node_id);
+void ionic_datapath_unregister_ah(struct ionic_datapath *dp, uint32_t ah_id);
+
+/*
  * RC/UC peer, learned from MODIFY_QP's IB_QP_DEST_QPN and the destination
  * address in the RoCE header template.  @dest_node_id is a mesh node id;
  * when it names this instance the peer QP is local and never leaves the
  * emulator.  Pass UINT32_MAX when there is no mesh.
  */
+/*
+ * The Q_Key a datagram must present to be delivered into this QP.
+ * MODIFY_QP carries it in the field a connected QP uses for its
+ * destination QPN, so it is set separately: for UD the two never both
+ * apply. Only UD and GSI consult it.
+ */
+void ionic_datapath_set_qkey(struct ionic_datapath *dp, uint32_t qp_id,
+                             uint32_t qkey);
 void ionic_datapath_set_dest(struct ionic_datapath *dp, uint32_t qp_id,
                              uint32_t dest_qp_id, uint32_t dest_node_id);
 

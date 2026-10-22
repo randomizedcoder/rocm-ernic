@@ -3,7 +3,7 @@
 # Static-analysis entry point for rocm-ernic. Ported from the xdp2
 # reference framework, re-implemented for this CMake project.
 #
-# Tools (userspace src/ and third-party/ only):
+# Tools (userspace src/ only):
 #   clang-tidy, cppcheck           via the CMake compilation database
 #   flawfinder, semgrep            raw-source scanners
 #   gcc-warnings, gcc-analyzer     full builds with extra diagnostics
@@ -82,7 +82,10 @@ let
           echo "=== Analysis Summary (${level}) ==="
           echo ""
           ${lib.concatMapStringsSep "\n"
-              (t: ''echo "${lib.fixedWidthString 16 " " (t.name + ":")} $(cat ${t.drv}/count.txt) findings"'')
+              (t: ''
+                echo "${lib.fixedWidthString 16 " " (t.name + ":")} $(cat ${t.drv}/count.txt) findings"
+                if [ -f ${t.drv}/coverage.txt ]; then cat ${t.drv}/coverage.txt; fi
+              '')
               tools}
           echo "${lib.fixedWidthString 16 " " "triage:"} $(cat $out/triage/count.txt 2>/dev/null || echo 0) high-confidence findings"
           echo ""

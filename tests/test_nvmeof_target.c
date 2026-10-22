@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "nvmeof.h"
 #include "nvmeof_target.h"
 
 #define HOST_BUF_SIZE (256 * 1024)
@@ -187,7 +188,8 @@ static int do_connect(struct nvmeof_queue *q, struct host_mem *h, uint16_t qid,
     struct capsule c;
     uint64_t addr = HOST_BASE;
 
-    cap_init(&c, NVME_ADMIN_FABRICS, 0x10 + qid);
+    /* The CID is an opaque 16-bit tag, so wrapping it is harmless. */
+    cap_init(&c, NVME_ADMIN_FABRICS, (uint16_t)(0x10u + qid));
     c.b[NVMEOF_SQE_FCTYPE_OFF] = NVMEOF_FCTYPE_CONNECT;
     nvme_put_le16(c.b + NVMEOF_CONNECT_QID_OFF, qid);
     nvme_put_le16(c.b + NVMEOF_CONNECT_SQSIZE_OFF, sqsize);
@@ -224,13 +226,19 @@ static const struct {
     {"size=0", false, "zero size"},
     {"size=-1", false, "negative size"},
     {"size=12Q", false, "bad size suffix"},
+    {"size=0x100000", false, "hex size"},
+    {"size= 1M", false, "size with a leading space"},
     {"bs=777", false, "unsupported block size"},
     {"size=1000,bs=512", false, "size not a multiple of bs"},
     {"nsid=0", false, "reserved nsid"},
     {"ip=999.1.1.1", false, "octet out of range"},
     {"ip=10.0.0", false, "short address"},
+    {"ip=10.0.0.1x", false, "address with trailing text"},
+    {"ip=-1.0.0.1", false, "negative octet"},
     {"port=0", false, "zero port"},
     {"port=70000", false, "port out of range"},
+    {"port=0x1145", false, "hex port"},
+    {"nsid=-1", false, "negative nsid"},
     {"queues=0", false, "zero queues"},
     {"queues=16", false, "one queue past the MR ceiling"},
     {"queues=65", false, "too many queues"},

@@ -12,13 +12,16 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
-#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <glib.h>
 
-#include "vmw/pvrdma.h"
+#include "pvrdma.h"
+#include "pvrdma_stats.h"
 #include "rdma_utils.h"
 
 /* Get or create QP stats entry */
@@ -41,12 +44,22 @@ PVRDMAQPStats *pvrdma_get_qp_stats(PVRDMADev *dev, uint32_t qp_handle)
     return stats;
 }
 
+static char *stats_nic_profile;
+
+int pvrdma_stats_set_nic_profile(const char *profile)
+{
+    free(stats_nic_profile);
+    stats_nic_profile = profile ? strdup(profile) : NULL;
+    return profile && !stats_nic_profile ? -1 : 0;
+}
+
 /* Write stats to file */
 void pvrdma_write_stats_impl(PVRDMADev *dev)
 {
     GHashTableIter iter;
     gpointer key, value;
     FILE *fp;
+    int fd;
     const char *opcode_names[] = {"RDMA_WRITE",
                                   "RDMA_WRITE_WITH_IMM",
                                   "SEND",
@@ -75,10 +88,24 @@ void pvrdma_write_stats_impl(PVRDMADev *dev)
         return;
     }
 
-    fp = fopen(dev->stats.stats_file, "w");
+    /* open() rather than fopen(), which would create the file with mode 0666
+     * less the umask.  With _FORTIFY_SOURCE, glibc 2.40 and later give Clang
+     * an open(path, flags, mode) overload, and android-cloexec-open looks for
+     * O_CLOEXEC in its mode */
+    /* NOLINTBEGIN(android-cloexec-open) */
+    fd = open(dev->stats.stats_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+              0644);
+    /* NOLINTEND(android-cloexec-open) */
+    if (fd < 0) {
+        rdma_error_report("Failed to open stats file %s: %s",
+                          dev->stats.stats_file, strerror(errno));
+        return;
+    }
+    fp = fdopen(fd, "w");
     if (!fp) {
         rdma_error_report("Failed to open stats file %s: %s",
                           dev->stats.stats_file, strerror(errno));
+        close(fd);
         return;
     }
 
@@ -100,6 +127,8 @@ void pvrdma_write_stats_impl(PVRDMADev *dev)
     fprintf(fp, "  %-11s : %s\n", "connection",
             dev->stats_connection_str ? dev->stats_connection_str
                                       : "(not set)");
+    fprintf(fp, "  %-11s : %s\n", "nic_profile",
+            stats_nic_profile ? stats_nic_profile : "(not set)");
     /* The " : " separator is what ernic-exporter splits every stat line on;
      * without it this counter is invisible to the exporter. */
     fprintf(fp, "\nWrite count : %" PRIu64 "\n\n",

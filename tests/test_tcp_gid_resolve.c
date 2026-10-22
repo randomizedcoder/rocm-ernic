@@ -13,9 +13,13 @@
  * caller can fail. These cases pin both halves: distinct GIDs must resolve
  * distinctly, and an unknown GID must not resolve at all.
  *
- * The static functions are reached by #including the translation unit;
- * resolution needs only the GID table, so the rest of the backend's
- * externals are stubbed out.
+ * Resolution is one of the entry points the ionic data path calls through
+ * the device whatever its backend, so the last cases check that all of them
+ * refuse a backend that isn't TCP.
+ *
+ * The test links rdma_backend_tcp.c and reaches its helpers through
+ * rdma_backend_tcp_priv.h; resolution needs only the GID table, so the rest
+ * of the backend's externals are stubbed out.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -24,16 +28,26 @@
  * See the LICENSE_GPL.md file in the top-level directory.
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <netinet/in.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "rocm-ernic-warnings.h"
+#include <glib.h>
+#include <infiniband/verbs.h>
 
-/* Pull in the code under test (including its static functions) */
-#include "rdma/rdma_backend_tcp.c"
+#include "qemu/error-report.h"
+#include "qemu/thread.h"
+#include "rdma/rdma_backend_ops.h"
+#include "rdma/rdma_backend_tcp_priv.h"
+#include "rdma_backend.h"
+#include "rdma_backend_defs.h"
 
 /* ---- Stubs for the TU's external symbols -------------------------------
  * None of these are reachable from the resolution path; they exist only to
@@ -51,65 +65,17 @@ void info_report(const char *fmt, ...)
 {
     (void)fmt;
 }
-int qemu_thread_create(QemuThread *thread, const char *name,
-                       void *(*start_routine)(void *), void *arg, int mode)
+int qemu_thread_create(QemuThread *thread, void *(*start_routine)(void *),
+                       void *arg)
 {
     (void)thread;
-    (void)name;
     (void)start_routine;
     (void)arg;
-    (void)mode;
     return 0;
-}
-void qemu_thread_exit(void *retval)
-{
-    (void)retval;
-    abort();
 }
 void qemu_thread_join(QemuThread *thread)
 {
     (void)thread;
-}
-void *pci_dma_map(PCIDevice *dev, uint64_t addr, uint64_t *len, int dir)
-{
-    (void)dev;
-    (void)addr;
-    (void)len;
-    (void)dir;
-    return NULL;
-}
-void pci_dma_unmap(PCIDevice *dev, void *buffer, uint64_t len, int dir,
-                   uint64_t access_len)
-{
-    (void)dev;
-    (void)buffer;
-    (void)len;
-    (void)dir;
-    (void)access_len;
-}
-int pci_dma_sync(PCIDevice *dev, uint64_t guest_addr, uint64_t len)
-{
-    (void)dev;
-    (void)guest_addr;
-    (void)len;
-    return 0;
-}
-void rdma_backend_complete_work(enum ibv_wc_status status, uint32_t vendor_err,
-                                uint32_t byte_len, uint32_t qp_num,
-                                enum ibv_wc_opcode opcode, void *ctx)
-{
-    (void)status;
-    (void)vendor_err;
-    (void)byte_len;
-    (void)qp_num;
-    (void)opcode;
-    (void)ctx;
-}
-RdmaRmMR *rdma_rm_get_mr(RdmaDeviceResources *dev_res, uint32_t mr_handle)
-{
-    (void)dev_res;
-    (void)mr_handle;
-    return NULL;
 }
 
 /* ---- Test helpers ------------------------------------------------------ */
@@ -290,11 +256,10 @@ static void test_env_parsing(void)
 
     printf("  ERNIC_TCP_GUEST_GIDS parsing\n");
 
-    unsetenv("ERNIC_TCP_GUEST_GIDS");
-    CHECK(tcp_parse_guest_gids(out) == 0, "unset env yielded GIDs");
+    CHECK(tcp_parse_guest_gids(NULL, out) == 0, "unset env yielded GIDs");
+    CHECK(tcp_parse_guest_gids("", out) == 0, "empty env yielded GIDs");
 
-    setenv("ERNIC_TCP_GUEST_GIDS", "192.168.100.11, fe80::3 ,bogus", 1);
-    uint32_t n = tcp_parse_guest_gids(out);
+    uint32_t n = tcp_parse_guest_gids("192.168.100.11, fe80::3 ,bogus", out);
     CHECK(n == 2, "expected 2 parsed GIDs, got %u", n);
 
     gid_v4(expect, 11);
@@ -306,8 +271,6 @@ static void test_env_parsing(void)
     expect[1] = 0x80;
     expect[15] = 0x03;
     CHECK(memcmp(out[1], expect, 16) == 0, "IPv6 entry was not stored raw");
-
-    unsetenv("ERNIC_TCP_GUEST_GIDS");
 }
 
 /* The advertisement goes on the wire whole, so the slots past num_gids must
@@ -379,9 +342,8 @@ static void test_gid_formatting(void)
  *
  * UD names its peer per work request, so the INIT->RTR transition carries
  * a zero GID. Requiring one there rejected every ordinary UD QP with -EIO
- * once the resolver stopped guessing. remote_node_id must stay UINT32_MAX
- * rather than the default 0, or a send that misses the per-send lookup
- * silently goes to the manager.
+ * once the resolver stopped guessing. A connected QP must still name a GID
+ * some node owns.
  */
 static void test_ud_rtr_needs_no_destination(void)
 {
@@ -390,7 +352,6 @@ static void test_ud_rtr_needs_no_destination(void)
     RdmaBackendQP bqp;
     union ibv_gid zero, known;
     uint8_t raw[16];
-    TcpQP *tqp;
     int rc;
 
     printf("  UD reaches RTR without a destination GID\n");
@@ -401,38 +362,25 @@ static void test_ud_rtr_needs_no_destination(void)
     dev.backend_type = RDMA_BACKEND_TYPE_TCP;
     bqp.ibqp = (struct ibv_qp *)(uintptr_t)7u;
 
-    qemu_mutex_init(&priv->lock);
-    priv->qps = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
-                                      (GDestroyNotify)g_free);
-    tqp = g_new0(TcpQP, 1);
-    tqp->qpn = 7;
-    tqp->remote_node_id = 0; /* the default tcp_create_qp() leaves */
-    g_hash_table_insert(priv->qps, GUINT_TO_POINTER(7u), tqp);
-
     gid_v4(raw, 11);
     tcp_gid_claims_set(priv, 2, (const uint8_t(*)[16]) & raw, 1);
     memset(&zero, 0, sizeof(zero));
     memcpy(known.raw, raw, 16);
 
-    /* UD with no destination: accepted, and left unrouted. */
-    rc = tcp_qp_state_rtr(&dev, &bqp, IBV_QPT_UD, 0, &zero, 99, 0, 0, false);
+    /* UD with no destination: accepted. */
+    rc = rdma_backend_ops_tcp.qp_state_rtr(&dev, &bqp, IBV_QPT_UD, 0, &zero, 99,
+                                           0, 0, false);
     CHECK(rc == 0, "UD RTR rejected with rc=%d", rc);
-    CHECK(tqp->remote_node_id == UINT32_MAX,
-          "UD QP left routed to node %u; a send would go there silently",
-          tqp->remote_node_id);
 
     /* A connected QP still must resolve, and still must fail when it cannot. */
-    rc = tcp_qp_state_rtr(&dev, &bqp, IBV_QPT_RC, 0, &zero, 99, 0, 0, false);
+    rc = rdma_backend_ops_tcp.qp_state_rtr(&dev, &bqp, IBV_QPT_RC, 0, &zero, 99,
+                                           0, 0, false);
     CHECK(rc != 0, "RC RTR accepted an unresolvable GID");
 
-    rc = tcp_qp_state_rtr(&dev, &bqp, IBV_QPT_RC, 0, &known, 99, 0, 0, false);
+    rc = rdma_backend_ops_tcp.qp_state_rtr(&dev, &bqp, IBV_QPT_RC, 0, &known,
+                                           99, 0, 0, false);
     CHECK(rc == 0, "RC RTR rejected a resolvable GID (rc=%d)", rc);
-    CHECK(tqp->remote_node_id == 2, "RC QP routed to node %u, expected 2",
-          tqp->remote_node_id);
 
-    g_hash_table_destroy(priv->qps);
-    priv->qps = NULL;
-    qemu_mutex_destroy(&priv->lock);
     priv_free(priv);
 }
 
@@ -512,6 +460,282 @@ static void test_empty_advertisement_withdraws(void)
     priv_free(priv);
 }
 
+/*
+ * A node the manager has declared dead keeps its claims but stops owning
+ * them, and takes them up again when it answers.
+ *
+ * This is what makes a restart survivable. A restarted node registers
+ * under a new id -- ids are allocated monotonically and a dead node is
+ * never evicted -- so without this its guest's GID is claimed by the id
+ * it had and the id it now has, the duplicate rule resolves it to
+ * neither, and the address stays unreachable for the rest of the mesh's
+ * life.
+ */
+static void test_dead_node_stops_owning_its_gids(void)
+{
+    TcpBackendPrivate *priv = priv_new();
+    uint8_t g[1][16];
+
+    printf("  a dead node stops owning its GIDs\n");
+
+    gid_v4(g[0], 70);
+    tcp_gid_claims_set(priv, 5, (const uint8_t(*)[16])g, 1);
+    CHECK(resolve(priv, g[0]) == 5, "claim did not take effect");
+
+    tcp_gid_claims_set_alive(priv, 5, false);
+    CHECK(resolve(priv, g[0]) == UINT32_MAX,
+          "a dead node still owns its GID (node %u)", resolve(priv, g[0]));
+
+    /* The claims are kept, so answering again is enough to get them back:
+     * a node that is merely late never re-advertises. */
+    tcp_gid_claims_set_alive(priv, 5, true);
+    CHECK(resolve(priv, g[0]) == 5,
+          "a revived node did not get its GID back (got %u)",
+          resolve(priv, g[0]));
+
+    /* The same guest returning under a new id owns the address, rather
+     * than deadlocking against the id it used to have. */
+    tcp_gid_claims_set_alive(priv, 5, false);
+    tcp_gid_claims_set(priv, 6, (const uint8_t(*)[16])g, 1);
+    CHECK(resolve(priv, g[0]) == 6,
+          "a restarted node did not take its own GID (got %u)",
+          resolve(priv, g[0]));
+
+    /* Two live claimants are still a contest; death is not a way to win
+     * one. */
+    tcp_gid_claims_set_alive(priv, 5, true);
+    CHECK(resolve(priv, g[0]) == UINT32_MAX,
+          "two live claimants resolved to node %u", resolve(priv, g[0]));
+
+    /* Marking a node with no claims live or dead does nothing. */
+    tcp_gid_claims_set_alive(priv, 99, false);
+    tcp_gid_claims_set_alive(priv, 99, true);
+    CHECK(resolve(priv, g[0]) == UINT32_MAX,
+          "a node with no claims changed the table");
+
+    priv_free(priv);
+}
+
+/* ---- Entry points on every backend ------------------------------------- */
+
+/*
+ * The ionic data path calls these through the device whatever its backend,
+ * and each reads backend_private as a TcpBackendPrivate. On any other
+ * backend that block is the other backend's own state, so each must check
+ * the backend type before touching it. Without the check, shutting down a
+ * loopback server that a guest had used locked a mutex past the end of the
+ * loopback state and wrote the receive callback after it.
+ */
+enum hook {
+    HOOK_LOCAL_NODE,
+    HOOK_NODE_FROM_GID,
+    HOOK_SET_CB,
+    HOOK_CLEAR_CB,
+    HOOK_SEND,
+};
+
+/* refused is what a hook returns when it leaves the block alone. The
+ * callback rows return nothing, so only the poison check catches them. */
+struct hook_case {
+    enum hook hook;
+    const char *name;
+    int64_t refused;
+};
+
+static const struct hook_case hook_cases[] = {
+    {HOOK_LOCAL_NODE, "tcp_backend_local_node_id()", UINT32_MAX},
+    {HOOK_NODE_FROM_GID, "tcp_backend_node_from_gid()", UINT32_MAX},
+    {HOOK_SET_CB, "tcp_backend_set_ionic_recv_cb(fn)", 0},
+    {HOOK_CLEAR_CB, "tcp_backend_set_ionic_recv_cb(NULL)", 0},
+    {HOOK_SEND, "tcp_backend_send_ionic_v()", -EINVAL},
+};
+
+struct backend_case {
+    RdmaBackendType type;
+    const char *name;
+};
+
+static const struct backend_case other_backends[] = {
+    {RDMA_BACKEND_TYPE_NONE, "none"},
+    {RDMA_BACKEND_TYPE_LOOPBACK, "loopback"},
+    {RDMA_BACKEND_TYPE_VERBS, "verbs"},
+    {RDMA_BACKEND_TYPE_NVMEOF, "nvmeof"},
+    {RDMA_BACKEND_TYPE_S3, "s3"},
+};
+
+#define MESH_PEER   2u   /* the node the hooks address and the GID's owner */
+#define POISON_BYTE 0xA5 /* fills another backend's private block */
+
+static void recv_fn(void *opaque, uint32_t src_node, const void *buf,
+                    size_t len)
+{
+    (void)opaque;
+    (void)src_node;
+    (void)buf;
+    (void)len;
+}
+
+/* The TCP backend keeps this pointer, so it has to outlive the call. */
+static int recv_opaque;
+
+/* Call @hook on @dev and return its result, or 0 for the callback rows. */
+static int64_t call_hook(RdmaBackendDev *dev, enum hook hook)
+{
+    static const uint8_t hdr[8] = {1};
+    union ibv_gid gid;
+
+    switch (hook) {
+    case HOOK_LOCAL_NODE:
+        return tcp_backend_local_node_id(dev);
+    case HOOK_NODE_FROM_GID:
+        gid_v4(gid.raw, 11);
+        return tcp_backend_node_from_gid(dev, &gid);
+    case HOOK_SET_CB:
+        tcp_backend_set_ionic_recv_cb(dev, recv_fn, &recv_opaque);
+        return 0;
+    case HOOK_CLEAR_CB:
+        tcp_backend_set_ionic_recv_cb(dev, NULL, NULL);
+        return 0;
+    case HOOK_SEND:
+        return tcp_backend_send_ionic_v(dev, MESH_PEER, hdr, sizeof(hdr), NULL,
+                                        0);
+    default:
+        abort(); /* every row names one of the cases above */
+    }
+}
+
+/*
+ * The other backend's block is as large as a TcpBackendPrivate and full of
+ * poison, so an entry point that skips the check reads poison and changes
+ * bytes compared here. With a smaller block it would write past the end,
+ * where only ASan might notice, and only if the write landed in a redzone.
+ */
+static void test_hooks_refuse_other_backends(void)
+{
+    const size_t n_backends =
+        sizeof(other_backends) / sizeof(other_backends[0]);
+    const size_t n_hooks = sizeof(hook_cases) / sizeof(hook_cases[0]);
+
+    printf("  mesh entry points leave other backends' state alone\n");
+
+    for (size_t b = 0; b < n_backends; b++) {
+        for (size_t h = 0; h < n_hooks; h++) {
+            const struct backend_case *bc = &other_backends[b];
+            const struct hook_case *hc = &hook_cases[h];
+            uint8_t *block = g_malloc(sizeof(TcpBackendPrivate));
+            RdmaBackendDev dev;
+            int64_t got;
+            size_t i;
+
+            memset(block, POISON_BYTE, sizeof(TcpBackendPrivate));
+            memset(&dev, 0, sizeof(dev));
+            dev.backend_type = bc->type;
+            dev.backend_private = block;
+
+            got = call_hook(&dev, hc->hook);
+            CHECK(got == hc->refused,
+                  "%s on the %s backend returned %" PRId64
+                  ", expected %" PRId64,
+                  hc->name, bc->name, got, hc->refused);
+
+            for (i = 0; i < sizeof(TcpBackendPrivate); i++) {
+                if (block[i] != POISON_BYTE) {
+                    break;
+                }
+            }
+            CHECK(i == sizeof(TcpBackendPrivate),
+                  "%s changed byte %zu of the %s backend's state", hc->name, i,
+                  bc->name);
+
+            g_free(block);
+        }
+    }
+}
+
+/* No device, or a TCP device whose private block is gone, is refused too. */
+static void test_hooks_refuse_missing_backend(void)
+{
+    const size_t n_hooks = sizeof(hook_cases) / sizeof(hook_cases[0]);
+    RdmaBackendDev dev;
+    int64_t got;
+
+    printf("  mesh entry points refuse a missing backend\n");
+
+    memset(&dev, 0, sizeof(dev));
+    dev.backend_type = RDMA_BACKEND_TYPE_TCP;
+
+    for (size_t h = 0; h < n_hooks; h++) {
+        const struct hook_case *hc = &hook_cases[h];
+
+        got = call_hook(NULL, hc->hook);
+        CHECK(got == hc->refused,
+              "%s with no device returned %" PRId64 ", expected %" PRId64,
+              hc->name, got, hc->refused);
+
+        got = call_hook(&dev, hc->hook);
+        CHECK(got == hc->refused,
+              "%s with no private block returned %" PRId64
+              ", expected %" PRId64,
+              hc->name, got, hc->refused);
+    }
+}
+
+/*
+ * On the TCP backend every entry point gets past the type check. The send
+ * fails for want of a connection, which only the code after the check can
+ * report; a refused backend would get -EINVAL.
+ */
+static void test_hooks_on_tcp(void)
+{
+    static const uint8_t hdr[8] = {1};
+    TcpBackendPrivate *priv = priv_new();
+    RdmaBackendDev dev;
+    union ibv_gid gid;
+    uint8_t raw[16];
+    uint32_t node;
+    int rc;
+
+    printf("  mesh entry points work on the TCP backend\n");
+
+    memset(&dev, 0, sizeof(dev));
+    dev.backend_private = priv;
+    dev.backend_type = RDMA_BACKEND_TYPE_TCP;
+
+    qemu_mutex_init(&priv->lock);
+    qemu_mutex_init(&priv->conn_table_lock);
+    priv->connections = g_hash_table_new(g_direct_hash, g_direct_equal);
+    atomic_store(&priv->local_node_id, 1);
+    gid_v4(raw, 11);
+    tcp_gid_claims_set(priv, MESH_PEER, (const uint8_t(*)[16]) & raw, 1);
+    memcpy(gid.raw, raw, 16);
+
+    node = tcp_backend_local_node_id(&dev);
+    CHECK(node == 1, "local node id is %u, expected 1", node);
+
+    node = tcp_backend_node_from_gid(&dev, &gid);
+    CHECK(node == MESH_PEER, "GID resolved to node %u, expected %u", node,
+          MESH_PEER);
+
+    tcp_backend_set_ionic_recv_cb(&dev, recv_fn, &recv_opaque);
+    CHECK(priv->ionic_recv_fn == recv_fn &&
+              priv->ionic_recv_opaque == &recv_opaque,
+          "receive callback not stored");
+
+    tcp_backend_set_ionic_recv_cb(&dev, NULL, NULL);
+    CHECK(!priv->ionic_recv_fn && !priv->ionic_recv_opaque,
+          "receive callback not cleared");
+
+    rc = tcp_backend_send_ionic_v(&dev, MESH_PEER, hdr, sizeof(hdr), NULL, 0);
+    CHECK(rc == -ENOTCONN,
+          "send to an unconnected node returned %d, expected -ENOTCONN", rc);
+
+    g_hash_table_destroy(priv->connections);
+    priv->connections = NULL;
+    qemu_mutex_destroy(&priv->conn_table_lock);
+    qemu_mutex_destroy(&priv->lock);
+    priv_free(priv);
+}
+
 int main(void)
 {
     printf("tcp GID resolution unit tests\n");
@@ -526,6 +750,10 @@ int main(void)
     test_ud_rtr_needs_no_destination();
     test_contested_gid_stays_contested();
     test_empty_advertisement_withdraws();
+    test_dead_node_stops_owning_its_gids();
+    test_hooks_refuse_other_backends();
+    test_hooks_refuse_missing_backend();
+    test_hooks_on_tcp();
 
     if (failures) {
         printf("FAILED: %d check(s)\n", failures);

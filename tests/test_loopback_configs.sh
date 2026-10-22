@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Test multiple loopback backend configurations.
 # Uses TEST_BIN for client test (default: test_rdma_cm). CI may set
@@ -22,14 +22,13 @@ NC='\033[0m' # No Color
 # Test configurations
 declare -a CONFIGS=(
     "loopback"
-    "loopback:mode=preserve"
-    "loopback:mode=zeros"
-    "loopback:mode=random"
-    "loopback:md5"
+    # Options the backend took before its PVRDMA data path was removed. It
+    # accepts and ignores them, so a command line that names them still works.
     "loopback:mode=preserve,md5"
 )
 
 # Cleanup function
+# shellcheck disable=SC2329  # called via trap, which ShellCheck misses when the script ends in exit
 cleanup() {
     local pid="${SERVER_PID:-}"
     if [ -n "$pid" ]; then
@@ -95,9 +94,6 @@ for config in "${CONFIGS[@]}"; do
         wait "$SERVER_PID" 2>/dev/null || true
         continue
     fi
-
-    # Make socket accessible
-    chmod 666 "$SOCKET_PATH" 2>/dev/null || true
 
     echo "✓ Server started (PID: $SERVER_PID)"
 

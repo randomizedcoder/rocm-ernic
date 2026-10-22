@@ -13,9 +13,9 @@
  *
  * These tests pin the published layout at the offsets the driver reads, so a
  * future change cannot silently go back to publishing zeros.  They run
- * entirely in-process: the TU is #included and the DMA entry points are
- * backed by a plain buffer, so no guest, no VM and no vfio-user socket is
- * involved.
+ * entirely in-process: the test calls the PORT_INIT and LIF_IDENTIFY
+ * handlers through ionic_eth_emu_priv.h and backs the DMA entry points with
+ * a plain buffer, so no guest, no VM and no vfio-user socket is involved.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -24,15 +24,22 @@
  * See the LICENSE_GPL.md file in the top-level directory.
  */
 
-#include <stdarg.h>
+#include <endian.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/uio.h>
 
-/* Pull in the code under test (including its static functions). */
-#include "ionic_eth_emu.c"
+#include <vfio-user/libvfio-user.h>
+
+#include "ionic_adminq.h"
+#include "ionic_datapath.h"
+#include "ionic_eth_emu.h"
+#include "ionic_eth_emu_priv.h"
+#include "ionic_eth_net.h"
+#include "rocm_ernic_compat.h"
 
 /* ---- Fake guest memory ------------------------------------------------- */
 
@@ -216,7 +223,7 @@ static void run_port_init(struct ionic_eth_emu *emu, uint64_t info_pa)
 
     cmd[0] = IONIC_CMD_PORT_INIT;
     memcpy(cmd + 8, &pa, 8);
-    handle_port_init(emu, cmd, comp);
+    ionic_eth_emu_handle_port_init(emu, cmd, comp);
     CHECK(comp[0] == 0, "PORT_INIT returned status %u, expected 0", comp[0]);
 }
 
@@ -263,14 +270,16 @@ static void test_speed_is_non_zero(void)
     memset(g_mem, 0, sizeof(g_mem));
     run_port_init(emu, PORT_INFO_PA);
 
-    CHECK(rd32(IONIC_PORT_INFO_STATUS_SPEED_OFF) == IONIC_ETH_LINK_SPEED_MBPS,
+    CHECK(rd32(IONIC_PORT_INFO_STATUS_SPEED_OFF) ==
+              emu->profile.link.speed_mbps,
           "status.speed is %u Mbps, expected %u",
           rd32(IONIC_PORT_INFO_STATUS_SPEED_OFF),
-          (unsigned)IONIC_ETH_LINK_SPEED_MBPS);
-    CHECK(rd32(IONIC_PORT_INFO_CONFIG_SPEED_OFF) == IONIC_ETH_LINK_SPEED_MBPS,
+          (unsigned)emu->profile.link.speed_mbps);
+    CHECK(rd32(IONIC_PORT_INFO_CONFIG_SPEED_OFF) ==
+              emu->profile.link.speed_mbps,
           "config.speed is %u Mbps, expected %u",
           rd32(IONIC_PORT_INFO_CONFIG_SPEED_OFF),
-          (unsigned)IONIC_ETH_LINK_SPEED_MBPS);
+          (unsigned)emu->profile.link.speed_mbps);
     CHECK(rd32(IONIC_PORT_INFO_STATUS_SPEED_OFF) != 0,
           "status.speed is zero -- UCX computes bandwidth 0.00 from this and "
           "refuses to create an endpoint");
@@ -376,9 +385,139 @@ static void test_write_stays_within_the_published_window(void)
     ionic_eth_emu_destroy(emu);
 }
 
+/*
+ * rdma.stats_type gates the driver's whole hw stats setup: with it zero,
+ * ionic_stats_init() never sends STATS_HDRS and the guest has no
+ * hw_counters directory.  It is the le16 straight after eq_qtype, 92 bytes
+ * into the rdma block.
+ */
+static void test_lif_identity_advertises_rdma_stats(void)
+{
+    struct ionic_eth_emu *emu = ionic_eth_emu_create(NULL, 4096);
+    static uint8_t data[DEVCMD_DATA_SIZE];
+    const uint8_t cmd[64] = {0};
+    uint8_t comp[16] = {0};
+    uint16_t le;
+
+    CHECK(emu != NULL, "ionic_eth_emu_create failed");
+    if (!emu)
+        return;
+
+    CHECK(LIF_ID_RDMA_STATS_TYPE_OFF == 92u,
+          "stats_type offset drifted from the ionic_if.h layout");
+
+    ionic_eth_emu_handle_lif_identify(emu, cmd, comp, data);
+    memcpy(&le, data + LIF_ID_RDMA_OFF + LIF_ID_RDMA_STATS_TYPE_OFF, 2);
+    CHECK(le16toh(le) == (IONIC_LIF_RDMA_STAT_GLOBAL | IONIC_LIF_RDMA_STAT_QP),
+          "stats_type is %#x, want GLOBAL|QP", (unsigned)le16toh(le));
+    CHECK(data[LIF_ID_RDMA_OFF + LIF_ID_RDMA_STATS_TYPE_OFF + 2] == 0,
+          "the byte after stats_type (rsvd) was written");
+
+    ionic_eth_emu_destroy(emu);
+}
+
+/* ---- SRQ capability in LIF_IDENTIFY ------------------------------------ */
+
+/*
+ * These are offset tests, because an offset is the only thing here that can
+ * be wrong silently. Get srq_qtype's position wrong and the guest still
+ * probes, still attaches, and simply reports max_srq as whatever rcq_sign_bit
+ * and stats_type happen to spell -- there is no error anywhere to notice.
+ *
+ * The layout is union ionic_lif_identity's rdma section (ionic_if.h, as
+ * extended by the SRQ series in rdma/for-next).
+ */
+static void test_srq_qtype_is_not_the_sixth_qtype(void)
+{
+    /* The trap: five contiguous qtypes, then a four-byte gap of stats_type,
+     * rsvd and rcq_sign_bit before srq_qtype. Striding past eq_qtype lands
+     * on stats_type, 4 bytes short. */
+    CHECK(LIF_ID_SRQ_QTYPE_OFF == 32u + 5u * 12u + 4u,
+          "srq_qtype is not four bytes past the fifth qtype slot");
+    CHECK(LIF_ID_SRQ_QTYPE_OFF == 96u, "srq_qtype offset drifted from 96");
+    CHECK(LIF_ID_ALLOC_QID_CAP_OFF == LIF_ID_SRQ_QTYPE_OFF + 12u + 5u,
+          "alloc_qid_cap is not rsvd2[5] past the end of srq_qtype");
+}
+
+static void test_srq_capability_is_published(void)
+{
+    struct ionic_eth_emu *emu = ionic_eth_emu_create(NULL, 4096);
+    uint8_t data[DEVCMD_DATA_SIZE];
+    uint8_t cmd[64] = {0};
+    uint8_t comp[16] = {0};
+    uint32_t qid_count;
+
+    memset(data, 0xaa, sizeof(data)); /* poison: prove we write every field */
+    ionic_eth_emu_handle_lif_identify(emu, cmd, comp, data);
+
+    const uint8_t *rdma = data + LIF_ID_RDMA_OFF;
+    const uint8_t *srq = rdma + LIF_ID_SRQ_QTYPE_OFF;
+
+    CHECK(srq[0] == IONIC_RDMA_QTYPE_SRQ, "srq_qtype.qtype is %u, expected %u",
+          srq[0], (unsigned)IONIC_RDMA_QTYPE_SRQ);
+
+    memcpy(&qid_count, srq + 4, 4);
+    /* This is the value the driver copies into max_srq. Zero here is exactly
+     * the state that makes UCX drop rc_verbs and leaves nixl with ud_verbs,
+     * which cannot do one-sided RDMA at all. */
+    CHECK(le32toh(qid_count) == IONIC_EMU_SRQ_COUNT,
+          "srq_qtype.qid_count is %u, expected %u", le32toh(qid_count),
+          (unsigned)IONIC_EMU_SRQ_COUNT);
+
+    CHECK((rdma[LIF_ID_ALLOC_QID_CAP_OFF] & IONIC_LIF_RDMA_ALLOC_QID_SRQ) != 0,
+          "alloc_qid_cap does not claim SRQ qid allocation");
+
+    ionic_eth_emu_destroy(emu);
+}
+
+/*
+ * Both halves of ionic_query_device()'s gate, together. Either one alone
+ * leaves max_srq at zero, and the symptom is identical in both cases, so a
+ * test that only checked the count would pass while the feature stayed dead.
+ */
+static void test_srq_gate_needs_count_and_alloc_bit(void)
+{
+    struct ionic_eth_emu *emu = ionic_eth_emu_create(NULL, 4096);
+    uint8_t data[DEVCMD_DATA_SIZE];
+    uint8_t cmd[64] = {0};
+    uint8_t comp[16] = {0};
+    uint32_t qid_count;
+
+    memset(data, 0, sizeof(data));
+    ionic_eth_emu_handle_lif_identify(emu, cmd, comp, data);
+
+    const uint8_t *rdma = data + LIF_ID_RDMA_OFF;
+    memcpy(&qid_count, rdma + LIF_ID_SRQ_QTYPE_OFF + 4, 4);
+
+    CHECK(le32toh(qid_count) != 0 &&
+              (rdma[LIF_ID_ALLOC_QID_CAP_OFF] & IONIC_LIF_RDMA_ALLOC_QID_SRQ),
+          "the guest's SRQ gate is not satisfied: count=%u cap=0x%02x",
+          le32toh(qid_count), rdma[LIF_ID_ALLOC_QID_CAP_OFF]);
+
+    ionic_eth_emu_destroy(emu);
+}
+
+/*
+ * The capability is useless without the opcodes to act on it: the driver
+ * gates each SRQ command on `admin_opcodes <= IONIC_V1_ADMIN_<op>`, so a
+ * watermark of 19 refuses CREATE_SRQ (26) through DESTROY_SRQ (29) however
+ * the identity is filled in.
+ */
+static void test_admin_opcode_watermark_covers_srq(void)
+{
+    CHECK(IONIC_RDMA_ADMIN_OPCODES > 29,
+          "admin_opcodes watermark %u does not reach DESTROY_SRQ (29)",
+          (unsigned)IONIC_RDMA_ADMIN_OPCODES);
+}
+
 int main(void)
 {
     test_published_offsets_match_the_driver_layout();
+    test_lif_identity_advertises_rdma_stats();
+    test_srq_qtype_is_not_the_sixth_qtype();
+    test_srq_capability_is_published();
+    test_srq_gate_needs_count_and_alloc_bit();
+    test_admin_opcode_watermark_covers_srq();
     test_transceiver_is_published();
     test_speed_is_non_zero();
     test_port_is_up();

@@ -9,6 +9,7 @@
 #define IONIC_ETH_EMU_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
 
@@ -33,6 +34,15 @@ typedef void (*ionic_rdma_devcmd_fn_t)(void *opaque, const uint8_t *cmd,
 struct ionic_eth_emu *ionic_eth_emu_create(vfu_ctx_t *vfu_ctx,
                                            size_t bar2_size);
 void ionic_eth_emu_destroy(struct ionic_eth_emu *emu);
+
+/*
+ * Give the device the identity and link of @profile (ionic_profile.h)
+ * instead of compat.  Call before any client connects: the guest reads the
+ * identity once, at probe.
+ */
+struct ionic_profile;
+void ionic_eth_emu_set_profile(struct ionic_eth_emu *emu,
+                               const struct ionic_profile *profile);
 
 /* Register the RDMA devcmd handler (called before any client connects). */
 void ionic_eth_emu_register_rdma_handler(struct ionic_eth_emu *emu,

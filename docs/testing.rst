@@ -77,6 +77,102 @@ needs ``CAP_NET_ADMIN``:
    sudo ip tuntap add dev ernic-ci0 mode tap user "$USER"
    ERNIC_TEST_TAP=ernic-ci0 ctest --test-dir build -R ionic-ci
 
+In-process ionic device harness
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``ernic-test-ionic-harness`` runs the whole emulated device
+inside the test process. It links every source the server is
+built from except ``rocm_ernic_server.c``, and replaces
+libvfio-user with ``tests/fake_vfu.c``, which keeps guest
+memory in heap buffers and counts interrupts instead of
+delivering them. ``tests/ionic_harness.c`` then plays the
+guest driver: devcmds through BAR0, doorbells through BAR2,
+and rings, work requests and completions in guest memory.
+It needs no VM, socket or RDMA device, so it runs in every
+CI build leg, sanitizers included.
+
+Each group of checks is its own CTest test:
+
+- ``ionic-harness-devcmds``, ``-bringup``: the devcmds, the
+  Ethernet admin queue, the RDMA bootstrap, and MSI-X
+  masking
+- ``ionic-harness-admin``: admin commands the device must
+  refuse
+- ``ionic-harness-rc``, ``-atomic``, ``-cq-events``: sends,
+  RDMA reads and writes, atomics and fast registration
+  between two RC QPs on the loopback backend, and CQ arming
+- ``ionic-harness-ud``, ``-srq``: datagrams, address handles
+  and shared receive queues
+- ``ionic-harness-eth``: Ethernet transmit and receive
+- ``ionic-harness-nvmeof``: the IB CM handshake on GSI, then
+  a Fabrics Connect and an Identify on the RC QP it binds
+
+.. code-block:: bash
+
+   ctest --test-dir build -R ionic-harness
+
+To run one group directly, pass its name, for example
+``build/tests/ernic-test-ionic-harness rc``. Setting
+``ERNIC_FAKE_VFU_LOG_LEVEL`` to a syslog level (``7`` for
+everything) prints the device's ``vfu_log()`` messages.
+
+Driving a server from Python
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``tests/py/`` stands in for a guest VM. Where the harness
+above replaces libvfio-user, these suites keep it: they speak
+the vfio-user protocol to a real ``rocm-ernic`` process over
+its Unix socket, as a VMM does. Guest memory is a ``memfd``
+that the client mmaps and hands to the server in a
+``DMA_MAP``, so the server maps the same pages and the real
+DMA path runs. Nothing here needs a VM, RDMA hardware, root,
+or any package outside the standard library.
+
+The modules under ``tests/py/ernic/`` are:
+
+- ``vfu.py`` -- the vfio-user client and ``GuestMemory``
+- ``server.py`` -- starting server processes, holding them to
+  a shutdown deadline, and counting the descriptors they hold
+- ``ionic.py`` -- the ionic driver, the Python counterpart of
+  ``tests/ionic_harness.c``
+- ``mesh.py`` -- the TCP mesh wire protocol, a fake manager,
+  and a fixture that starts a manager and some workers
+- ``check.py`` -- the small test runner the suites report
+  through
+
+Three suites are registered with CTest:
+
+- ``ernic-vfu-client``: version negotiation, device and
+  region info, PCI configuration space, BAR access, DMA
+  mapping, interrupts, reset and reconnect -- and the
+  offsets, counts, addresses and vector ranges a client must
+  not get away with
+- ``ernic-ionic-driver``: bring-up, connected queue pairs,
+  memory regions whose pages are deliberately out of order,
+  sends with several SGEs or an inline payload, RDMA reads
+  and writes, shared receive queues, and the keys and lengths
+  that must fail
+- ``ernic-mesh-stress``: a three-node mesh under traffic
+  between every pair of nodes, peers that send frames no real
+  node sends, the protocol version gate in both directions,
+  and nodes killed and restarted while the manager's
+  descriptors are counted
+
+.. code-block:: bash
+
+   ctest --test-dir build -R '^ernic-(vfu|ionic-driver|mesh)'
+
+To run one directly, and to vary the mesh:
+
+.. code-block:: bash
+
+   python3 -I tests/py/test_mesh_stress.py \
+       --server build/rocm-ernic --size 5
+
+Like the shell suites, they run the server under the command
+in ``ERNIC_TEST_SERVER_WRAPPER``, so CI's valgrind leg
+covers them too.
+
 NVMe-oF tests
 ^^^^^^^^^^^^^
 
@@ -165,6 +261,53 @@ With verbose output on failure:
 .. code-block:: bash
 
    ctest --test-dir build --output-on-failure
+
+To run the tests under valgrind's memcheck, as the Build and
+Test workflow's GCC Debug leg does, use a GCC build without the
+sanitizers and with valgrind installed before configuring. Leave
+out the tests that start the server or run a script, which
+valgrind would only check the script for:
+
+.. code-block:: bash
+
+   skip='pci-config-test|find-rdma-device-tuple|server-lifecycle'
+   skip+='|ionic-server-smoke|ionic-ci|tcp-mesh-ci|nvmeof-ci|s3-ci'
+   skip+='|cmake-subproject'
+   opts='--leak-check=full --track-origins=yes --num-callers=40'
+   opts+=' --error-exitcode=1'
+   ctest --test-dir build -T memcheck --output-on-failure \
+     --overwrite "MemoryCheckCommand=$(command -v valgrind)" \
+     --overwrite "MemoryCheckCommandOptions=$opts" \
+     -E "^($skip)$"
+
+Each test's valgrind report is in
+``build/Testing/Temporary/MemoryChecker.<n>.log``.
+
+The test scripts that start the server run it under the command
+in ``ERNIC_TEST_SERVER_WRAPPER``, if that's set, as does
+``tests/test_loopback_ci.sh``. The command is split on
+whitespace, so no word of it can contain a space.
+``test_server_lifecycle`` doesn't read it; run that program under
+valgrind with ``--trace-children=yes``, which follows it into
+each server it starts. To run the server under valgrind, as the
+same leg does, have valgrind write a log for each process, since
+the scripts don't all check how the server exited. With ``opts``
+as above:
+
+.. code-block:: bash
+
+   srv='pci-config-test|ionic-server-smoke'
+   srv+='|ionic-ci|tcp-mesh-ci|nvmeof-ci|s3-ci'
+   logs="$PWD/build/valgrind-server"
+   rm -rf "$logs"
+   mkdir "$logs"
+   opts+=" --log-file=$logs/%p.log"
+   export ERNIC_TEST_SERVER_WRAPPER="valgrind $opts"
+   ctest --test-dir build --output-on-failure -R "^($srv)$"
+   valgrind --trace-children=yes $opts build/tests/test_server_lifecycle
+   grep -L 'ERROR SUMMARY: 0 errors' "$logs"/*.log
+
+The last command lists the logs with a report.
 
 Multi-VM RDMA Testing
 ---------------------

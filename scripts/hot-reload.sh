@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # hot-reload.sh
 #
@@ -116,8 +116,7 @@ wait_for_exit() {
 wait_for_socket() {
     local path=$1
     local timeout=${2:-15}
-    local i
-    for i in $(seq 1 $((timeout * 2))); do
+    for _ in $(seq 1 $((timeout * 2))); do
         if [ -S "$path" ]; then
             return 0
         fi
@@ -218,8 +217,12 @@ sudo rm -f "${SOCKET_PATH}"
 
 # --- step 5: start new server --------------------------------
 log_step "5/6 Starting new server (backend: ${BACKEND})..."
+# The server runs as root, and the VM may run as the invoking user, as
+# local-vm-test.sh and run-vm start it, so the socket gets that user's group
+# or QEMU couldn't connect to it.
 sudo "${PROJECT_ROOT}/build/rocm-ernic" \
     --socket "${SOCKET_PATH}" \
+    --socket-group "$(id -g)" \
     --backend "${BACKEND}" \
     --log-file "${SERVER_LOG}" &
 NEW_PID=$!
